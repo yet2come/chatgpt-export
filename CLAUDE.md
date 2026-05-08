@@ -56,9 +56,9 @@ pbcopy < chat-single-export.js
 
 ## バージョン履歴の慣習
 
-`chat-single-export.js` 冒頭の doc コメントに `vX.Y` ごとの修正点を箇条書きする慣習がある（現在 v7.14）。動作を変える修正を入れるときは:
+`chat-single-export.js` 冒頭の doc コメントに `vX.Y` ごとの修正点を箇条書きする慣習がある（現在 v7.15）。動作を変える修正を入れるときは:
 
 1. 冒頭の doc コメントに新しいバージョン見出しを足し、変更点を箇条書きで残す。
-2. IIFE 末尾の `console.log('   v7.14: …')`（[chat-single-export.js:1023](chat-single-export.js)）を新バージョン文言に更新する。
+2. IIFE 末尾の `console.log('   v7.15: …')`（[chat-single-export.js:1052](chat-single-export.js)）を新バージョン文言に更新する。
 
-[README.md](README.md) §運用方針 / トラブルシューティングも v7.14 を前提に書かれているため、ユーザー可視の挙動を変える場合は同節も更新する。
+[README.md](README.md) §運用方針 / トラブルシューティングも v7.15 を前提に書かれているため、ユーザー可視の挙動を変える場合は同節も更新する。

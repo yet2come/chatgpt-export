@@ -1,5 +1,12 @@
 /**
- * ChatGPT single conversation exporter v7.14
+ * ChatGPT single conversation exporter v7.15
+ *
+ * v7.15 fixes:
+ * - DOM image fetch (`tryDomDownload`) now restricts URLs to chatgpt.com /
+ *   openai.com hosts before sending cookies, preventing a malicious assistant
+ *   message from rendering an off-host <img> with an "estuary/content" path
+ *   and tricking this exporter into a credentialed cross-origin fetch.
+ * - Backend signed `download_url` is required to be https before fetching.
  *
  * v7.14 fixes:
  * - Some images are present in message.metadata.attachments and get downloaded,
@@ -90,6 +97,18 @@
       return ms > 0 ? Math.min(120000, ms) : 0;
     }
     return null;
+  };
+
+  const isAllowedAssetHost = (url) => {
+    try {
+      const u = new URL(url, location.origin);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      return u.hostname === location.hostname
+        || u.hostname.endsWith('.openai.com')
+        || u.hostname.endsWith('.chatgpt.com');
+    } catch (_) {
+      return false;
+    }
   };
 
   let backendCooldownUntil = 0;
@@ -519,6 +538,12 @@
       const j = await r.json().catch(() => null);
       const url = j?.download_url || j?.url || j?.file_url || j?.signed_url;
       if (!url) return null;
+      try {
+        const u = new URL(url);
+        if (u.protocol !== 'https:') return null;
+      } catch (_) {
+        return null;
+      }
       const r2 = await fetch(url, { credentials: 'omit' });
       if (!r2.ok) return null;
       return r2.blob();
@@ -529,6 +554,10 @@
   const tryDomDownload = async (base) => {
     const url = domByBase.get(base);
     if (!url) return null;
+    if (!isAllowedAssetHost(url)) {
+      console.warn(`  ⚠️ DOM画像URLのホスト不許可のためスキップ: ${url}`);
+      return null;
+    }
     const r = await fetch(url, { credentials: 'include' });
     if (!r.ok) return null;
     return r.blob();
@@ -1020,5 +1049,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v7.14: Canvas/文書作成メッセージも本文として保持します');
+  console.log('   v7.15: DOM画像/署名URL fetchのホスト・スキーム検証を追加しました');
 })();
