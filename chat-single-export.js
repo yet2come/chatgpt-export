@@ -1,5 +1,13 @@
 /**
- * ChatGPT single conversation exporter v7.15
+ * ChatGPT single conversation exporter v7.16
+ *
+ * v7.16 fixes:
+ * - Output directory is renamed from `images/` to `assets/` so that
+ *   non-image attachments (csv / tsv / json / pdf / txt) are no longer
+ *   stored under a misleading folder name. Markdown link paths are updated
+ *   accordingly. Old exports keep their existing `images/` paths and are
+ *   unaffected, but if you re-run into the same output folder, the new
+ *   `assets/` folder is created alongside the previous `images/`.
  *
  * v7.15 fixes:
  * - DOM image fetch (`tryDomDownload`) now restricts URLs to chatgpt.com /
@@ -82,7 +90,7 @@
   const headers = { Authorization: `Bearer ${token}` };
 
   const rootDir = await window.showDirectoryPicker({ mode: 'readwrite' });
-  const imagesDir = await rootDir.getDirectoryHandle('images', { create: true });
+  const assetsDir = await rootDir.getDirectoryHandle('assets', { create: true });
 
   const parseRetryAfter = (raw) => {
     if (!raw) return null;
@@ -607,7 +615,7 @@
         continue;
       }
     }
-    const fh = await imagesDir.getFileHandle(`${base}.${ext}`, { create: true });
+    const fh = await assetsDir.getFileHandle(`${base}.${ext}`, { create: true });
     const w = await fh.createWritable();
     await w.write(blob);
     await w.close();
@@ -730,7 +738,7 @@
     }
     if (seenBases) seenBases.add(base);
     renderedAssetBases.add(base);
-    const path = `images/${base}.${ext}`;
+    const path = `assets/${base}.${ext}`;
     const linkLabel = (assetMeta.get(base) || {}).filename || `${base}.${ext}`;
     const ref = isPreviewableImageExt(ext)
       ? `![](${path})`
@@ -1012,7 +1020,7 @@
     let appendix = `\n\n---\n\n## DOM検出画像 (JSON未参照)\n\n`;
     appendix += `_本文中に対応する asset_pointer がなかったが、画面上にレンダリングされていた画像です。_\n\n`;
     for (const { base, ext, turnIndex } of domOnly) {
-      const path = `images/${base}.${ext}`;
+      const path = `assets/${base}.${ext}`;
       const note = Number.isInteger(turnIndex) ? ` _DOM turn ${turnIndex}_` : '';
       appendix += isPreviewableImageExt(ext)
         ? `- ![](${path})${note}\n`
@@ -1029,7 +1037,7 @@
     let appendix = `\n\n---\n\n## 保存済み未参照画像\n\n`;
     appendix += `_画像ファイルは取得済みですが、会話JSON内の本文位置と対応付けられなかったため、末尾にまとめて列挙しています。_\n\n`;
     for (const [base, ext] of savedUnreferenced) {
-      const path = `images/${base}.${ext}`;
+      const path = `assets/${base}.${ext}`;
       appendix += isPreviewableImageExt(ext)
         ? `- ![](${path})\n`
         : `- [添付ファイル: ${base}.${ext}](${path})\n`;
@@ -1049,5 +1057,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v7.15: DOM画像/署名URL fetchのホスト・スキーム検証を追加しました');
+  console.log('   v7.16: 出力ディレクトリを images/ から assets/ に変更しました');
 })();
