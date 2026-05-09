@@ -1,6 +1,23 @@
 /**
- * ChatGPT bulk conversation exporter v8.0
+ * ChatGPT bulk conversation exporter v8.1
  *
+ * v8.1 fixes:
+ * - chat-single-export.js v7.17 で導入された Obsidian 連携用の出力機能を
+ *   bulk にも反映:
+ *   - emitFrontmatter (既定 true): YAML frontmatter (title /
+ *     conversation_id / url / created_at / updated_at / exported_at /
+ *     model / message_count / tags) を Markdown 冒頭に付与する。
+ *   - emitBlockRefs (既定 false): 各メッセージ末尾に Obsidian block
+ *     reference anchor `^msg-yymmdd-HHMMSS` を付ける。
+ *   - obsidianImageWidth (既定 false): 数値時に画像 alt が `Image|<幅>`
+ *     になる。CommonMark の alt セマンティクスとは引き換え。
+ *   - includeImagePrompts (既定 false): 画像生成 tool 呼び出し
+ *     (dalle.text2im 等) の JSON プロンプトを画像直前に fenced JSON で
+ *     出力する。
+ *   single と同じデフォルト挙動になるため、bulk 出力の冒頭にも会話単位の
+ *   frontmatter が並び、Dataview などで一括索引できる。
+ *
+ * v8.0 fixes:
  * 指定スコープの会話を一括で Markdown + assets としてローカル保存する。
  * chat-single-export.js と同じ出力レイアウトに揃え、サブフォルダ分割は行わない:
  *
@@ -37,6 +54,10 @@
     forceCloseAllFences: false,
     allowLooseQueryId: false,
     recursiveMessageAssetScan: true,
+    emitFrontmatter: true,
+    emitBlockRefs: false,
+    obsidianImageWidth: false,
+    includeImagePrompts: false,
 
     scope: { type: 'latest', count: 50 },
     // 例:
@@ -436,6 +457,25 @@
     const pad = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   };
+  const blockRefId = (ts) => {
+    if (!ts) return null;
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    const yy = String(d.getFullYear()).slice(-2);
+    return `msg-${yy}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  };
+  const isoFromEpoch = (ts) => {
+    if (!ts) return '';
+    return new Date(ts * 1000).toISOString();
+  };
+  const yamlEscape = (s) => {
+    const text = String(s == null ? '' : s);
+    if (!text) return '""';
+    if (/[:#\[\]{}&*!|>'"%@`,\n]/.test(text) || /^\s|\s$/.test(text)) {
+      return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+    return text;
+  };
   const linearize = (mapping, current) => {
     const chain = [];
     let id = current;
@@ -769,8 +809,12 @@
       renderedAssetBases.add(base);
       const path = `assets/${base}.${ext}`;
       const linkLabel = (assetMeta.get(base) || {}).filename || `${base}.${ext}`;
+      const widthOpt = OPTIONS.obsidianImageWidth;
+      const imgAlt = (typeof widthOpt === 'number' && Number.isFinite(widthOpt) && widthOpt > 0)
+        ? `Image|${Math.floor(widthOpt)}`
+        : '';
       const ref = isPreviewableImageExt(ext)
-        ? `![](${path})`
+        ? `![${imgAlt}](${path})`
         : `[添付ファイル: ${escapeMdLinkText(linkLabel)}](${path})`;
       return fragment ? `${ref}\n_(ページ指定: ${fragment.slice(1)})_` : ref;
     };
@@ -871,15 +915,25 @@
 
       if (role === 'assistant' && recipient !== 'all') {
         const doc = renderAssistantDocumentMessage(msg);
-        if (!doc) return null;
-        parts.push(doc.body);
-        appendMessageAssetRefs();
-        for (const r of renderExternalLinks(msg)) parts.push(r);
-        const body = parts.filter(p => p && p.trim()).join('\n\n');
-        if (!body.trim()) return null;
-        let header = `### 📝 Document${doc.title ? `: ${cleanHeading(doc.title)}` : ''}`;
-        if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
-        return `${header}\n\n${body}`;
+        if (doc) {
+          parts.push(doc.body);
+          appendMessageAssetRefs();
+          for (const r of renderExternalLinks(msg)) parts.push(r);
+          const body = parts.filter(p => p && p.trim()).join('\n\n');
+          if (!body.trim()) return null;
+          let header = `### 📝 Document${doc.title ? `: ${cleanHeading(doc.title)}` : ''}`;
+          if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
+          return `${header}\n\n${body}`;
+        }
+        if (OPTIONS.includeImagePrompts && /(?:^|\.)(?:dalle|image_gen|image_generator)/i.test(recipient)) {
+          const promptText = messageRawTextParts(msg).map(t => String(t || '').trim()).filter(Boolean).join('\n\n');
+          if (!promptText) return null;
+          let header = '### 🎨 生成プロンプト';
+          if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
+          const fence = codeFenceFor(promptText);
+          return `${header}\n\n${fence}json\n${promptText}\n${fence}`;
+        }
+        return null;
       }
 
       if (role === 'tool') {
@@ -928,18 +982,42 @@
     const cTime = convo.create_time;
     const uTime = convo.update_time;
     const model = convo.default_model_slug || '(モデル不明)';
-    const front = `# ${headingTitle}\n\n`
-      + `- **作成日時:** ${fmtTime(cTime)}\n`
-      + `- **最終更新:** ${fmtTime(uTime)}\n`
-      + `- **モデル:** ${model}\n`
-      + `- **会話ID:** ${convo.conversation_id}\n\n---\n\n`;
     const chain = linearize(convo.mapping, convo.current_node);
     const blocks = [];
     for (const node of chain) {
       const block = renderMessage(node.message);
-      if (block) blocks.push(block);
+      if (block) {
+        let body = block;
+        if (OPTIONS.emitBlockRefs) {
+          const ref = blockRefId(node.message?.create_time);
+          if (ref) body = `${block}\n\n^${ref}`;
+        }
+        blocks.push(body);
+      }
     }
-    let md = front + blocks.join('\n\n---\n\n') + '\n';
+    let frontmatter = '';
+    if (OPTIONS.emitFrontmatter) {
+      const lines = [
+        '---',
+        `title: ${yamlEscape(headingTitle)}`,
+        `conversation_id: ${yamlEscape(convo.conversation_id || convId)}`,
+        `url: ${yamlEscape(`https://chatgpt.com/c/${convId}`)}`,
+      ];
+      if (cTime) lines.push(`created_at: ${yamlEscape(isoFromEpoch(cTime))}`);
+      if (uTime) lines.push(`updated_at: ${yamlEscape(isoFromEpoch(uTime))}`);
+      lines.push(`exported_at: ${yamlEscape(new Date().toISOString())}`);
+      if (model) lines.push(`model: ${yamlEscape(model)}`);
+      lines.push(`message_count: ${blocks.length}`);
+      lines.push('tags: [ChatGPT]');
+      lines.push('---', '');
+      frontmatter = lines.join('\n') + '\n';
+    }
+    const headerSection = `# ${headingTitle}\n\n`
+      + `- **作成日時:** ${fmtTime(cTime)}\n`
+      + `- **最終更新:** ${fmtTime(uTime)}\n`
+      + `- **モデル:** ${model}\n`
+      + `- **会話ID:** ${convo.conversation_id}\n\n---\n\n`;
+    let md = frontmatter + headerSection + blocks.join('\n\n---\n\n') + '\n';
 
     const savedUnreferenced = Object.entries(extMap)
       .filter(([base]) => !renderedAssetBases.has(base))
@@ -1065,5 +1143,5 @@
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v8.0: bulk export — JSON-only / backend-only。DOM-only 画像が疑わしい会話は chat-single-export.js で個別再実行してください');
+  console.log('   v8.1: YAML frontmatter / block ref / 画像プロンプト保持の OPTIONS を bulk にも反映しました');
 })();

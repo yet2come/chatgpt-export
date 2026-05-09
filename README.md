@@ -99,6 +99,10 @@ const OPTIONS = {
   forceCloseAllFences: false,
   allowLooseQueryId: false,
   recursiveMessageAssetScan: true,
+  emitFrontmatter: true,
+  emitBlockRefs: false,
+  obsidianImageWidth: false,
+  includeImagePrompts: false,
 
   scope: { type: 'latest', count: 50 },
   perConversationDelayMs: 1500,
@@ -106,6 +110,8 @@ const OPTIONS = {
   maxBatchPauseMs: 5 * 60 * 1000,
 };
 ```
+
+`emitFrontmatter` / `emitBlockRefs` / `obsidianImageWidth` / `includeImagePrompts` の意味は single 側 §OPTIONS と同じです（v8.1 で取り込み）。
 
 | オプション | 既定値 | 説明 |
 |---|---:|---|
@@ -339,6 +345,6 @@ forceCloseAllFences: true
 
 v7.17 (`chat-single-export.js`) は、個人のチャット保全を主用途とした実用版です。v7.2 から、message JSON 再帰スキャン、DOM ターン位置マッピング、attachments 由来の画像反映、画像付き tool メッセージの本文順出力、file_search 参照ノイズの除外、取得不能添付ファイル名の保持、外部参考リンクの保持、重複 asset 参照の抑制、引用残骸・file プレースホルダ・期限切れ sandbox リンクの除去、Canvas/文書作成メッセージの保持、asset alias 解決の強化、保存済み未参照画像の末尾補遺、v7.15 で DOM 画像 fetch および署名 URL fetch のホスト・スキーム検証、v7.16 で出力ディレクトリを `images/` から `assets/` に変更（非画像添付も同じフォルダに収まるため）、v7.17 で YAML frontmatter のデフォルト出力と Obsidian 連携用 OPTIONS（`emitBlockRefs` / `obsidianImageWidth` / `includeImagePrompts`）を追加しています。これ以上の変更は、正しさの改善というより運用方針の選択になります。
 
-v8.0 (`chat-bulk-export.js`) は単一エクスポートの姉妹スクリプトとして、複数会話の一括取得を JSON-only / backend-only で行います。DOM 経路を持たないため画像取りこぼしの可能性がある反面、レジューム可能でレート制限を尊重したアーカイブ用途に適します。普段は single を、まとめて取りたい時だけ bulk を使う運用を想定しています。
+v8.1 (`chat-bulk-export.js`) は単一エクスポートの姉妹スクリプトとして、複数会話の一括取得を JSON-only / backend-only で行います。DOM 経路を持たないため画像取りこぼしの可能性がある反面、レジューム可能でレート制限を尊重したアーカイブ用途に適します。v8.1 では single の v7.17 と同じ Obsidian 連携用 OPTIONS（`emitFrontmatter` / `emitBlockRefs` / `obsidianImageWidth` / `includeImagePrompts`）を取り込み、出力フォーマットを single と揃えています。普段は single を、まとめて取りたい時だけ bulk を使う運用を想定しています。
 
 まずは既定値で使い、具体的な不都合が出た場合にだけ `OPTIONS` を変更してください。
