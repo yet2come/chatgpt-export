@@ -1,5 +1,16 @@
 /**
- * ChatGPT single conversation exporter v0.7.19
+ * ChatGPT single conversation exporter v0.7.20
+ *
+ * v0.7.20 fixes (重要 — データ消失バグ修正):
+ * - ファイル名末尾の衝突回避 ID を UUID 先頭 8 文字 → 末尾 8 文字 に変更。
+ *   ChatGPT の会話 ID は UUID v7 で先頭 8 文字が採番タイムスタンプ秒の
+ *   ため、同じ秒に大量採番された会話 (例: バックエンド移行で 0x681fdcb1
+ *   付近に集中) で先頭 8 文字が衝突する。同じ日付・同じタイトル
+ *   (例: "New chat") の会話と組み合わさると同名ファイルとなり、
+ *   getFileHandle({ create: true }) + createWritable() が後勝ちで
+ *   上書きするため、複数会話を同じフォルダに連続 export した場合に
+ *   データ消失が発生していた。末尾 8 文字は完全ランダム部 (4.3B 通り)
+ *   で衝突確率は実質ゼロ。bulk (v0.8.11) と同じ修正を single にも適用。
  *
  * v0.7.19 fixes:
  * - 生成画像 (sediment://file_XXX) が backend ファイル API で 401 を返していた
@@ -119,7 +130,11 @@
   }
 
   const convId = m[1];
-  const convId8 = convId.slice(0, 8);
+  // ファイル名衝突回避用 ID は UUID 末尾 8 文字 (完全ランダム部) を使う。
+  // 旧実装は先頭 8 文字 (UUID v7 のタイムスタンプ秒部) を使っていたが、
+  // 同じ秒に採番された会話間で衝突し、同日同タイトル ("New chat" など) と
+  // 重なると上書きでデータ消失していた。末尾 8 文字なら 4.3B 通りで実質ユニーク。
+  const convIdFile = convId.slice(-8);
   console.log('🎯 対象会話:', convId);
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -1188,7 +1203,7 @@
   if (OPTIONS.forceCloseAllFences) md = ensureCodeFenceClosed(md);
 
   const dateStr = cTime ? fmtTime(cTime).slice(0, 10) : 'unknown';
-  const fname = `${dateStr}_${safeFilename(headingTitle)}_${convId8}.md`;
+  const fname = `${dateStr}_${safeFilename(headingTitle)}_${convIdFile}.md`;
   const fh = await rootDir.getFileHandle(fname, { create: true });
   const w = await fh.createWritable();
   await w.write(md);
@@ -1197,5 +1212,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v0.7.19: ファイルダウンロードのエンドポイントを /backend-api/files/download/<id>?conversation_id=… に切り替えました');
+  console.log('   v0.7.20: ファイル名末尾の ID を UUID 先頭 8 文字 → 末尾 8 文字に変更 (同名ファイル上書きでのデータ消失を防止)');
 })();

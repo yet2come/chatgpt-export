@@ -1,5 +1,77 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.4
+ * ChatGPT bulk conversation exporter v0.8.11
+ *
+ * v0.8.11 fixes (重要 — データ消失バグ修正):
+ * - ファイル名末尾の衝突回避 ID を UUID 先頭 8 文字 → 末尾 8 文字 に変更。
+ *   ChatGPT の会話 ID は UUID v7 で先頭 8 文字が採番タイムスタンプ秒の
+ *   ため、同じ秒に大量採番された会話 (例: バックエンド移行で 0x681fdcb1
+ *   付近に集中) で先頭 8 文字が衝突する。同じ日付・同じタイトル
+ *   (例: "New chat") の会話と組み合わさると同名ファイルとなり、
+ *   getFileHandle({ create: true }) + createWritable() が後勝ちで
+ *   上書きするため、過去の export でデータ消失が発生していた。
+ *   末尾 8 文字は完全ランダム部 (4.3B 通り) で衝突確率は実質ゼロ。
+ *
+ *   既存ファイルは旧スキーマ (先頭 8 文字) のまま残り、新規 export は
+ *   末尾 8 文字で書かれる。manifest の mdFile は別追跡のため resume は
+ *   壊れない。ただし過去の上書きで失われたデータは復元できないため、
+ *   消失が疑われる会話 ("New chat" 系の重複候補) は手動で resume を
+ *   無効化して再 export する必要がある。
+ *
+ * v0.8.10 fixes:
+ * - ログから会話 ID 抜粋を完全削除し、`[i/N]` インデックスのみで識別する
+ *   よう変更。実際の処理はすべて full UUID で行われており、短縮 ID は
+ *   人間の可読性のためだけに存在していた。`exportConversation` に tag を
+ *   渡し、内部ログも `[i/N]` 形式に統一。後追い調査が必要な場合は完了
+ *   ログの ${fname} (日付 + タイトル + 8 文字 ID) で照合できる。
+ *
+ * v0.8.9 (skipped): ログ ID を末尾 6 文字に変更したが、v0.8.10 で
+ *   ID 表示自体を廃止したため上書き。
+ *
+ * v0.8.8 fixes:
+ * - resume 比較に ±2 秒の許容範囲を導入。ChatGPT の list API と
+ *   full JSON API が同一会話に対して 100〜200ms 異なる update_time を返す
+ *   ため、floor 後の秒整数が 1 秒ズレて毎回再エクスポートに回る現象が
+ *   v0.8.7 修正後も残っていた。実ユーザの会話更新は分〜時単位なので
+ *   ±2 秒の許容は誤判定を起こさない。
+ * - manifest の sourceUpdatedAt は list 側 (convMeta.update_time) を
+ *   優先して保存するように変更。比較で使う側を保存することで、
+ *   今後生成される manifest からは API drift が起きなくなる。
+ *   idList scope では convMeta.update_time が無いので full JSON に
+ *   フォールバック (resume 比較は元々できないので影響なし)。
+ *
+ * v0.8.7 fixes:
+ * - resume が事実上機能していなかった致命バグを修正。manifest に保存される
+ *   sourceUpdatedAt は full JSON 由来の float 秒 (例 1778319436.195755) で、
+ *   list API は ISO 文字列 (例 "2026-05-09T09:37:16.195755Z") を返す。
+ *   tsToSeconds は文字列分岐で `Math.floor(t / 1000)` していたが、数値分岐では
+ *   passthrough していたため、float 秒 vs 秒整数 の比較が常に不一致になり、
+ *   done 済み会話を毎回再エクスポートしていた。数値側にも Math.floor を適用。
+ *
+ * v0.8.6 fixes:
+ * - resume が効いているかを判別できる起動ログを追加。manifest 読込時に
+ *   `done / failed / 全 N 件` を出力し、0 件のときは「別フォルダを選択した
+ *   可能性があります」と警告する。これまでは readManifest が silent に
+ *   newManifest fallback していたため、フォルダ選択ミスや manifest 破損
+ *   を Console から判別できなかった。
+ * - resume 比較が失敗して再エクスポートに回った場合、最初の 3 件まで
+ *   理由を出力 (timestamp 不一致 / 値が空)。原因切り分け用の診断ログ。
+ *
+ * v0.8.5 fixes:
+ * - 後半に入って quota が枯渇すると /backend-api/conversation/<id> が
+ *   連続して 429 を返し、1 件ごとに 65 秒級のフルバックオフを毎回踏む
+ *   問題を解消。fetchWithBackoff に opts.noteThrottle を追加し、
+ *   conversation 取得 / conversation list 取得で 429 を観測した瞬間に
+ *   noteBackendThrottle() を呼んで backendCooldownUntil を更新する。
+ *   exportConversation 冒頭でも waitForCooldown() を呼ぶことで、
+ *   一度 throttle を観測したら後続の会話はまとめて cooldown 解除を待つ。
+ *   これで N 会話 × 65 秒の連鎖待機が、1 回 30 秒の cooldown に圧縮される。
+ * - perConversationDelayMs を初期値として扱い、throttle 観測で 2 倍
+ *   (上限 15s)、10 件連続成功で 0.7 倍に漸減する hysteresis に変更。
+ *   固定 1500ms では quota 復帰前に再び 429 を踏みやすかった。
+ *   OPTIONS.perConversationDelayMs の意味は「初期値 / 下限」になる。
+ * - バックオフ初期値を 1500ms から 5000ms に引き上げ。最初 2 回の
+ *   2 秒待機は ChatGPT 側の quota 回復にほぼ無効で attempt を浪費して
+ *   いた。retry-after ヘッダがあれば従来どおりそれを優先する。
  *
  * v0.8.4 fixes:
  * - 既定 scope を { type: 'all' } に変更。直近 50 件モードは
@@ -56,7 +128,7 @@
  *   <選択フォルダ>/
  *   ├── _bulk-manifest.json
  *   ├── _bulk-failed.log
- *   ├── <YYYY-MM-DD>_<title>_<convId8>.md
+ *   ├── <YYYY-MM-DD>_<title>_<convIdSuffix8>.md  (UUID 末尾 8 文字)
  *   ├── ...
  *   └── assets/
  *       ├── file-...png
@@ -180,12 +252,38 @@
     return null;
   };
 
+  // 適応 delay: throttle 観測で 2 倍に伸び、N 件連続成功で漸減して初期値に戻る。
+  // 固定 delay では一度 quota を超えると毎会話 429 → フルバックオフ階段を踏むため、
+  // 観測ベースで負荷を下げる必要がある。
+  const BACKOFF_BASE_MS = 5000;
+  const ADAPTIVE_DELAY_MAX_MS = 15000;
+  const ADAPTIVE_DECAY_AFTER = 10;
+  let adaptiveDelayMs = OPTIONS.perConversationDelayMs;
+  let consecutiveSuccess = 0;
+  const noteAdaptiveSuccess = () => {
+    consecutiveSuccess++;
+    if (consecutiveSuccess >= ADAPTIVE_DECAY_AFTER && adaptiveDelayMs > OPTIONS.perConversationDelayMs) {
+      const next = Math.max(OPTIONS.perConversationDelayMs, Math.round(adaptiveDelayMs * 0.7));
+      if (next !== adaptiveDelayMs) {
+        adaptiveDelayMs = next;
+        console.log(`  📉 会話間 delay を ${adaptiveDelayMs}ms に減衰`);
+      }
+      consecutiveSuccess = 0;
+    }
+  };
+
   let backendCooldownUntil = 0;
   let totalBatchPauseMs = 0;
   const noteBackendThrottle = (retryAfterMs) => {
     const base = Math.max(retryAfterMs ?? 0, 30000);
     backendCooldownUntil = Math.max(backendCooldownUntil, now() + base);
     console.log(`  🧊 backend クールダウン: 次回 ${Math.round((backendCooldownUntil - now()) / 1000)}秒後まで使用しません`);
+    const bumped = Math.min(ADAPTIVE_DELAY_MAX_MS, Math.max(adaptiveDelayMs * 2, OPTIONS.perConversationDelayMs * 2));
+    if (bumped !== adaptiveDelayMs) {
+      adaptiveDelayMs = bumped;
+      console.log(`  📈 会話間 delay を ${adaptiveDelayMs}ms に引き上げ`);
+    }
+    consecutiveSuccess = 0;
   };
   const backendAvailable = () => now() >= backendCooldownUntil;
   const waitForCooldown = async () => {
@@ -204,6 +302,7 @@
   const fetchWithBackoff = async (url, init = {}, label = url, opts = {}) => {
     const maxAttempts = opts.maxAttempts ?? 26;
     const returnOnThrottle = opts.returnOnThrottle ?? false;
+    const noteThrottle = opts.noteThrottle ?? false;
     let lastErr;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let res;
@@ -212,14 +311,15 @@
       } catch (e) {
         lastErr = e;
         if (attempt + 1 >= maxAttempts) break;
-        const wait = Math.max(MIN_WAIT_MS, Math.min(60000, 1500 * Math.pow(1.6, attempt)));
+        const wait = Math.max(MIN_WAIT_MS, Math.min(60000, BACKOFF_BASE_MS * Math.pow(1.6, attempt)));
         await sleep(wait);
         continue;
       }
       if (res.status === 429 || res.status === 503) {
-        if (returnOnThrottle) return res;
         const ra = parseRetryAfter(res.headers.get('retry-after'));
-        const wait = Math.max(MIN_WAIT_MS, ra != null ? ra : Math.min(60000, 1500 * Math.pow(1.6, attempt)));
+        if (noteThrottle) noteBackendThrottle(ra);
+        if (returnOnThrottle) return res;
+        const wait = Math.max(MIN_WAIT_MS, ra != null ? ra : Math.min(60000, BACKOFF_BASE_MS * Math.pow(1.6, attempt)));
         console.log(`  ⏳ ${res.status} ${label}: ${Math.round(wait / 1000)}秒待機 (${attempt + 1}/${maxAttempts})`);
         if (attempt + 1 >= maxAttempts) return res;
         await sleep(wait);
@@ -232,8 +332,14 @@
 
   // ===== Conversation list =====
 
+  // 注意: ChatGPT の API は update_time の型が一貫しない。
+  //   /backend-api/conversations (list)        → ISO 文字列 ("2026-05-09T09:37:16.195755Z")
+  //   /backend-api/conversation/<id> (full)    → float 秒 (1778319436.195755)
+  // resume 比較では両者を秒整数に正規化する必要があるため、数値分岐でも必ず floor する。
+  // 過去 (v0.8.5 以前) は数値を passthrough していたため float vs ISO→秒整数 で常に不一致になり、
+  // resume が機能していなかった。
   const tsToSeconds = (v) => {
-    if (typeof v === 'number') return v;
+    if (typeof v === 'number') return Math.floor(v);
     if (typeof v === 'string') {
       const t = Date.parse(v);
       return Number.isFinite(t) ? Math.floor(t / 1000) : 0;
@@ -243,7 +349,7 @@
 
   const fetchConversationPage = async (offset, limit) => {
     const url = `/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`;
-    const r = await fetchWithBackoff(url, { headers }, `conversations[${offset}..]`, { maxAttempts: 8 });
+    const r = await fetchWithBackoff(url, { headers }, `conversations[${offset}..]`, { maxAttempts: 8, noteThrottle: true });
     if (!r.ok) throw new Error(`会話リスト取得失敗: HTTP ${r.status}`);
     return r.json();
   };
@@ -701,12 +807,12 @@
 
   // ===== Per-conversation export =====
 
-  const exportConversation = async (convMeta) => {
+  const exportConversation = async (convMeta, tag) => {
     const convId = convMeta.id;
-    const convId8 = convId.slice(0, 8);
 
-    console.log(`📥 [${convId8}] 会話JSON取得中...`);
-    const convoRes = await fetchWithBackoff(`/backend-api/conversation/${convId}`, { headers }, `conversation/${convId8}`, { maxAttempts: 26 });
+    await waitForCooldown();
+    console.log(`📥 ${tag} 会話JSON取得中...`);
+    const convoRes = await fetchWithBackoff(`/backend-api/conversation/${convId}`, { headers }, `conversation ${tag}`, { maxAttempts: 26, noteThrottle: true });
     if (!convoRes.ok) throw new Error(`会話JSON取得失敗: HTTP ${convoRes.status}`);
     const convo = await convoRes.json();
     convo.conversation_id = convo.conversation_id || convId;
@@ -752,7 +858,7 @@
         if (seg && isStrictFileId(seg)) base = seg;
       }
       if (!base) {
-        console.warn(`  ⚠️ [${convId8}] ID として認識できない asset をスキップ: ${raw}`);
+        console.warn(`  ⚠️ ${tag} ID として認識できない asset をスキップ: ${raw}`);
         return null;
       }
       const fragment = noScheme.includes('#') ? noScheme.slice(noScheme.indexOf('#')) : '';
@@ -785,7 +891,7 @@
       for (const raw of messageAssetRaws(msg)) addAsset(raw, 'json');
     }
     const jsonAssetCount = assets.size;
-    console.log(`  🧩 [${convId8}] JSON 由来 asset: ${jsonAssetCount} 件 / alias: ${aliasToBase.size}`);
+    console.log(`  🧩 ${tag} JSON 由来 asset: ${jsonAssetCount} 件 / alias: ${aliasToBase.size}`);
 
     const resolveAssetBase = (raw) => {
       if (!raw) return null;
@@ -831,25 +937,25 @@
         blob = await downloadAssetBlob(base, convId);
       } catch (e) {
         if (/バッチ累積待機/.test(String(e?.message || ''))) throw e;
-        console.warn(`  ⚠️ [${convId8}] backend ${base}: ${e.message}`);
+        console.warn(`  ⚠️ ${tag} backend ${base}: ${e.message}`);
       }
       if (!blob) {
         failed++;
-        console.warn(`  ❌ [${convId8}] ${base}${asset.composite ? ' (composite)' : ''} [${asset.source}]: 取得不可`);
+        console.warn(`  ❌ ${tag} ${base}${asset.composite ? ' (composite)' : ''} [${asset.source}]: 取得不可`);
         continue;
       }
       const headBytes = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
       const head = headBytes.slice(0, 8);
       if (head[0] === 0x3c) {
         skipped++;
-        console.log(`  ⏭️ [${convId8}] ${base} (HTML応答)`);
+        console.log(`  ⏭️ ${tag} ${base} (HTML応答)`);
         continue;
       }
       const sampleText = new TextDecoder('utf-8').decode(headBytes);
       const ext = guessExt(blob.type, head, sampleText);
       if (ext === 'bin') {
         binCount++;
-        console.warn(`  ⚠️ [${convId8}] ${base}: 拡張子不明 (mime=${blob.type || 'unknown'} size=${blob.size}). binBehavior=${OPTIONS.binBehavior}`);
+        console.warn(`  ⚠️ ${tag} ${base}: 拡張子不明 (mime=${blob.type || 'unknown'} size=${blob.size}). binBehavior=${OPTIONS.binBehavior}`);
         if (OPTIONS.binBehavior === 'skip') {
           skipped++;
           continue;
@@ -861,10 +967,10 @@
       await w.close();
       extMap[base] = ext;
       saved++;
-      console.log(`  💾 [${convId8}] ${base}.${ext} [backend/${asset.source}]${asset.composite ? ' composite' : ''}`);
+      console.log(`  💾 ${tag} ${base}.${ext} [backend/${asset.source}]${asset.composite ? ' composite' : ''}`);
       await sleep(250);
     }
-    console.log(`  ✅ [${convId8}] asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
+    console.log(`  ✅ ${tag} asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
 
     const displayNameForAsset = (base) => {
       const meta = assetMeta.get(base) || {};
@@ -883,7 +989,7 @@
           meta.size ? `size=${meta.size}` : '',
           base ? `id=${base}` : '',
         ].filter(Boolean).join(' / ');
-        console.warn(`  🔎 [${convId8}] 描画失敗: raw=${raw} / base=${base} / ext-keys-sample=${Object.keys(extMap).slice(0, 3).join(',')}`);
+        console.warn(`  🔎 ${tag} 描画失敗: raw=${raw} / base=${base} / ext-keys-sample=${Object.keys(extMap).slice(0, 3).join(',')}`);
         if (base && seenBases) seenBases.add(base);
         if (base) renderedAssetBases.add(base);
         return details
@@ -1122,13 +1228,18 @@
     if (OPTIONS.forceCloseAllFences) md = ensureCodeFenceClosed(md);
 
     const dateStr = cTime ? fmtTime(cTime).slice(0, 10) : 'unknown';
-    const fname = `${dateStr}_${safeFilename(headingTitle)}_${convId8}.md`;
+    // ファイル名衝突回避用 ID は UUID 末尾 8 文字 (完全ランダム部) を使う。
+    // 旧実装は先頭 8 文字 (UUID v7 のタイムスタンプ秒部) を使っていたが、
+    // 同じ秒に採番された会話間で衝突し、同日同タイトル ("New chat" など) と
+    // 重なると上書きでデータ消失していた。末尾 8 文字なら 4.3B 通りで実質ユニーク。
+    const convIdFile = convId.slice(-8);
+    const fname = `${dateStr}_${safeFilename(headingTitle)}_${convIdFile}.md`;
     const fh = await rootDir.getFileHandle(fname, { create: true });
     const w = await fh.createWritable();
     await w.write(md);
     await w.close();
 
-    console.log(`  🎉 [${convId8}] 完了: ${fname}`);
+    console.log(`  🎉 ${tag} 完了: ${fname}`);
     return { fname, saved, skipped, failed, binCount, jsonAssetCount, sourceUpdatedAt: uTime ?? cTime ?? null };
   };
 
@@ -1162,6 +1273,16 @@
   manifest.scope = OPTIONS.scope;
   manifest.mode = 'json-only';
   manifest.conversations = manifest.conversations || {};
+  if (OPTIONS.resume) {
+    const entries = Object.values(manifest.conversations);
+    const doneCount = entries.filter(e => e?.status === 'done').length;
+    const failedCount = entries.filter(e => e?.status === 'failed').length;
+    console.log(`📂 manifest 読込: done ${doneCount} / failed ${failedCount} / 全 ${entries.length} 件`);
+    if (entries.length === 0) {
+      console.log('   ⚠️ manifest 0 件 — 別フォルダを選択した可能性があります。前回と同じフォルダか確認してください');
+    }
+  }
+  let resumeMismatchLogged = 0;
 
   let succeeded = 0;
   let skippedConv = 0;
@@ -1174,27 +1295,47 @@
       break;
     }
     const convMeta = targets[i];
-    const tag = `[${i + 1}/${targets.length}] ${convMeta.id.slice(0, 8)}`;
+    // 表示用は [i/N] のみ。実際の処理は full UUID で行うため短縮 ID は不要。
+    // 完了ログの ${fname} に日付・タイトル・先頭 8 文字 ID が出るので、
+    // [i/N] と ${fname} の対応で会話を後追いできる。
+    const tag = `[${i + 1}/${targets.length}]`;
     const prev = manifest.conversations[convMeta.id];
     // idList 経路は convMeta.update_time を持たないため resume 比較不可。
     // その場合は常に再エクスポートする（明示指定された ID なので妥当）。
+    // 許容範囲付きで比較: list API と full JSON API が同じ会話に対して
+    // 100〜200ms 異なる update_time を返すため、floor 後の秒整数が 1 秒ズレる
+    // ケースが頻発する。実ユーザの会話更新は分〜時単位で起きるので
+    // ±2 秒の許容は安全。
+    const RESUME_TOLERANCE_SEC = 2;
     if (
       OPTIONS.resume
       && prev?.status === 'done'
       && convMeta.update_time
       && prev.sourceUpdatedAt
-      && tsToSeconds(prev.sourceUpdatedAt) === tsToSeconds(convMeta.update_time)
+      && Math.abs(tsToSeconds(prev.sourceUpdatedAt) - tsToSeconds(convMeta.update_time)) <= RESUME_TOLERANCE_SEC
     ) {
       skippedConv++;
       console.log(`⏭️  ${tag} 変更なし — スキップ`);
       continue;
     }
+    if (OPTIONS.resume && prev?.status === 'done' && resumeMismatchLogged < 3) {
+      const reason = !convMeta.update_time
+        ? `convMeta.update_time が空 (${convMeta.update_time})`
+        : !prev.sourceUpdatedAt
+          ? `manifest.sourceUpdatedAt が空`
+          : `timestamp 不一致 (差 ${Math.abs(tsToSeconds(prev.sourceUpdatedAt) - tsToSeconds(convMeta.update_time))}秒): manifest=${prev.sourceUpdatedAt} (→${tsToSeconds(prev.sourceUpdatedAt)}) vs list=${convMeta.update_time} (→${tsToSeconds(convMeta.update_time)})`;
+      console.log(`  🔁 ${tag} done 済みだが再エクスポート: ${reason}`);
+      resumeMismatchLogged++;
+    }
     try {
-      const stats = await exportConversation(convMeta);
+      const stats = await exportConversation(convMeta, tag);
       manifest.conversations[convMeta.id] = {
         status: 'done',
         exportedAt: new Date().toISOString(),
-        sourceUpdatedAt: stats.sourceUpdatedAt ?? convMeta.update_time ?? null,
+        // list API と full JSON で update_time が ~150ms ズレるため、resume 比較で
+        // 使う側 (= convMeta.update_time, list 由来) を優先して保存する。
+        // idList scope では convMeta.update_time が無いので full JSON にフォールバック。
+        sourceUpdatedAt: convMeta.update_time ?? stats.sourceUpdatedAt ?? null,
         mdFile: stats.fname,
         stats: {
           saved: stats.saved,
@@ -1205,6 +1346,7 @@
         },
       };
       succeeded++;
+      noteAdaptiveSuccess();
     } catch (e) {
       failedConv++;
       const msg = String(e?.message || e);
@@ -1223,10 +1365,10 @@
       }
     }
     await writeManifest(manifest);
-    if (i + 1 < targets.length) await sleep(OPTIONS.perConversationDelayMs);
+    if (i + 1 < targets.length) await sleep(adaptiveDelayMs);
   }
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.4: 既定 scope を all に変更（旧 { type: \'latest\', count: 50 } はコメントで保持）');
+  console.log('   v0.8.11: ファイル名末尾の ID を UUID 先頭 8 文字 → 末尾 8 文字に変更 (同名ファイル上書きでのデータ消失を防止)');
 })();
