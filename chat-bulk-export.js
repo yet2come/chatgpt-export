@@ -1,5 +1,11 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.3
+ * ChatGPT bulk conversation exporter v0.8.4
+ *
+ * v0.8.4 fixes:
+ * - 既定 scope を { type: 'all' } に変更。直近 50 件モードは
+ *   コメントで残しているため、必要なら 1 行戻すだけで復帰できる。
+ *   全件モードは長時間バッチになるため、停止 → resume での再実行を
+ *   前提とする運用は従来どおり。
  *
  * v0.8.3 fixes:
  * - 生成画像 (sediment://file_XXX) が backend ファイル API で 401 を返して
@@ -85,9 +91,9 @@
     obsidianImageWidth: false,
     includeImagePrompts: false,
 
-    scope: { type: 'latest', count: 50 },
+    scope: { type: 'all' },
+    // 旧既定: { type: 'latest', count: 50 }
     // 例:
-    //   { type: 'all' }
     //   { type: 'sinceDays', days: 30 }
     //   { type: 'idList', ids: ['xxxx-...', 'yyyy-...'] }
     perConversationDelayMs: 1500,
@@ -1222,5 +1228,5 @@
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.3: ファイルダウンロードのエンドポイントを /backend-api/files/download/<id>?conversation_id=… に切り替えました');
+  console.log('   v0.8.4: 既定 scope を all に変更（旧 { type: \'latest\', count: 50 } はコメントで保持）');
 })();

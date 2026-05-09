@@ -104,7 +104,7 @@ const OPTIONS = {
   obsidianImageWidth: false,
   includeImagePrompts: false,
 
-  scope: { type: 'latest', count: 50 },
+  scope: { type: 'all' },
   perConversationDelayMs: 1500,
   resume: true,
   maxBatchPauseMs: 5 * 60 * 1000,
@@ -115,12 +115,12 @@ const OPTIONS = {
 
 | オプション | 既定値 | 説明 |
 |---|---:|---|
-| `scope` | `{ type: 'latest', count: 50 }` | 対象範囲。`{ type: 'all' }` / `{ type: 'sinceDays', days: 30 }` / `{ type: 'idList', ids: [...] }` も指定可能。`idList` は会話一覧を経由せず `/backend-api/conversation/<id>` を直接 fetch するため、見つからない ID は `_bulk-failed.log` に失敗として記録される。レジューム比較できないので毎回再エクスポートになる |
+| `scope` | `{ type: 'all' }` | 対象範囲。`{ type: 'latest', count: N }` / `{ type: 'sinceDays', days: 30 }` / `{ type: 'idList', ids: [...] }` も指定可能。旧既定は `{ type: 'latest', count: 50 }`（直近 N 件のみ取得したい場合は `count` を指定）。`idList` は会話一覧を経由せず `/backend-api/conversation/<id>` を直接 fetch するため、見つからない ID は `_bulk-failed.log` に失敗として記録される。レジューム比較できないので毎回再エクスポートになる |
 | `perConversationDelayMs` | `1500` | 会話ごとの待機時間（ミリ秒） |
 | `resume` | `true` | `_bulk-manifest.json` を読み、`update_time` が変わっていない `done` 会話をスキップ |
 | `maxBatchPauseMs` | `300000` | クールダウン累積待機の上限。超えるとバッチを停止し、再実行で resume |
 
-`scope.type === 'all'` は会話数が多い場合に長時間バッチになるため、明示的に切り替えてから使ってください。既定では直近 50 件のみ処理します。
+既定で全会話を順に処理します（`scope: { type: 'all' }`）。会話数が多い環境では長時間バッチになり、backend cooldown で自動停止することもあるため、初回はディスク容量・所要時間を見積もってから実行し、停止 → 同じフォルダで resume を回す運用を前提にしてください。直近 N 件のみ処理したい場合は `scope: { type: 'latest', count: N }` に書き換えます。
 
 ### bulk の制限事項（重要）
 
