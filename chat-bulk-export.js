@@ -179,16 +179,14 @@
     return all;
   };
 
+  // idList は collectConversations を経由せず main で直接 fetch するため
+  // ここでは扱わない。
   const filterByScope = (list, scope) => {
     if (scope.type === 'all') return list;
     if (scope.type === 'latest') return list.slice(0, scope.count);
     if (scope.type === 'sinceDays') {
       const cutoff = (now() / 1000) - (scope.days * 86400);
       return list.filter(c => tsToSeconds(c.update_time ?? c.create_time) >= cutoff);
-    }
-    if (scope.type === 'idList') {
-      const want = new Set(scope.ids);
-      return list.filter(c => want.has(c.id));
     }
     return [];
   };
@@ -535,10 +533,11 @@
   };
 
   // ===== Bulk-aware asset download (waits on cooldown, no DOM fallback) =====
+  // 終了条件は (a) 成功 (b) 4xx/5xx 等の恒久失敗 (c) waitForCooldown が
+  // maxBatchPauseMs 超過で throw、の 3 つのみ。429/503 が続く限り再試行する。
 
-  const MAX_THROTTLE_ROUNDS = 5;
   const downloadAssetBlob = async (fileId) => {
-    for (let round = 0; round < MAX_THROTTLE_ROUNDS; round++) {
+    while (true) {
       await waitForCooldown();
       let r;
       try {
@@ -573,7 +572,6 @@
       }
       return r.blob();
     }
-    return null;
   };
 
   // ===== Per-conversation export =====
@@ -968,16 +966,29 @@
     await w.close();
 
     console.log(`  🎉 [${convId8}] 完了: ${fname}`);
-    return { fname, saved, skipped, failed, binCount, jsonAssetCount };
+    return { fname, saved, skipped, failed, binCount, jsonAssetCount, sourceUpdatedAt: uTime ?? cTime ?? null };
   };
 
   // ===== Main loop =====
 
-  console.log('📋 会話リスト取得中...');
-  const allList = await collectConversations(OPTIONS.scope);
-  console.log(`  → 取得 ${allList.length} 件`);
-  const targets = filterByScope(allList, OPTIONS.scope);
-  console.log(`📋 対象会話: ${targets.length} 件 (scope=${JSON.stringify(OPTIONS.scope)})`);
+  let targets;
+  if (OPTIONS.scope.type === 'idList') {
+    const ids = Array.isArray(OPTIONS.scope.ids) ? OPTIONS.scope.ids.filter(Boolean) : [];
+    if (!ids.length) {
+      console.log('idList が空のため終了します');
+      return;
+    }
+    console.log(`📋 idList: ${ids.length} 件を /backend-api/conversation/<id> から直接取得します`);
+    // 一覧取得を経由しないため、404 等の見つからない ID は exportConversation 内で
+    // 例外となり main loop で failed として manifest / _bulk-failed.log に記録される。
+    targets = ids.map(id => ({ id }));
+  } else {
+    console.log('📋 会話リスト取得中...');
+    const allList = await collectConversations(OPTIONS.scope);
+    console.log(`  → 取得 ${allList.length} 件`);
+    targets = filterByScope(allList, OPTIONS.scope);
+    console.log(`📋 対象会話: ${targets.length} 件 (scope=${JSON.stringify(OPTIONS.scope)})`);
+  }
   if (!targets.length) {
     console.log('対象がないため終了します');
     return;
@@ -1002,9 +1013,13 @@
     const convMeta = targets[i];
     const tag = `[${i + 1}/${targets.length}] ${convMeta.id.slice(0, 8)}`;
     const prev = manifest.conversations[convMeta.id];
+    // idList 経路は convMeta.update_time を持たないため resume 比較不可。
+    // その場合は常に再エクスポートする（明示指定された ID なので妥当）。
     if (
       OPTIONS.resume
       && prev?.status === 'done'
+      && convMeta.update_time
+      && prev.sourceUpdatedAt
       && tsToSeconds(prev.sourceUpdatedAt) === tsToSeconds(convMeta.update_time)
     ) {
       skippedConv++;
@@ -1016,7 +1031,7 @@
       manifest.conversations[convMeta.id] = {
         status: 'done',
         exportedAt: new Date().toISOString(),
-        sourceUpdatedAt: convMeta.update_time,
+        sourceUpdatedAt: stats.sourceUpdatedAt ?? convMeta.update_time ?? null,
         mdFile: stats.fname,
         stats: {
           saved: stats.saved,
@@ -1033,7 +1048,7 @@
       manifest.conversations[convMeta.id] = {
         status: 'failed',
         exportedAt: new Date().toISOString(),
-        sourceUpdatedAt: convMeta.update_time,
+        sourceUpdatedAt: convMeta.update_time ?? null,
         error: msg,
       };
       await appendFailedLog(`${new Date().toISOString()}\t${convMeta.id}\t${msg}`);

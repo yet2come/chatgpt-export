@@ -109,7 +109,7 @@ const OPTIONS = {
 
 | オプション | 既定値 | 説明 |
 |---|---:|---|
-| `scope` | `{ type: 'latest', count: 50 }` | 対象範囲。`{ type: 'all' }` / `{ type: 'sinceDays', days: 30 }` / `{ type: 'idList', ids: [...] }` も指定可能 |
+| `scope` | `{ type: 'latest', count: 50 }` | 対象範囲。`{ type: 'all' }` / `{ type: 'sinceDays', days: 30 }` / `{ type: 'idList', ids: [...] }` も指定可能。`idList` は会話一覧を経由せず `/backend-api/conversation/<id>` を直接 fetch するため、見つからない ID は `_bulk-failed.log` に失敗として記録される。レジューム比較できないので毎回再エクスポートになる |
 | `perConversationDelayMs` | `1500` | 会話ごとの待機時間（ミリ秒） |
 | `resume` | `true` | `_bulk-manifest.json` を読み、`update_time` が変わっていない `done` 会話をスキップ |
 | `maxBatchPauseMs` | `300000` | クールダウン累積待機の上限。超えるとバッチを停止し、再実行で resume |

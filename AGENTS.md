@@ -58,7 +58,7 @@ pbcopy < chat-bulk-export.js     # 複数会話を一括エクスポート
 [chat-bulk-export.js](chat-bulk-export.js) は **JSON-only / backend-only** で動作する独立スクリプト。設計上の前提が single とは異なる:
 
 - DOM 補正・DOM download fallback は使わない。対象会話の DOM が画面に存在しないため。
-- 429 / 503 は cooldown 解除を `waitForCooldown` で待ってから同じ asset を再試行（最大 5 ラウンド）。バッチ全体での累積待機を `OPTIONS.maxBatchPauseMs` で打ち切る。
+- 429 / 503 は cooldown 解除を `waitForCooldown` で待ってから同じ asset を再試行する（ラウンド上限なし）。バッチ全体の累積待機が `OPTIONS.maxBatchPauseMs` を超えた時点で `waitForCooldown` が throw し、main loop がレジューム情報を保存してバッチ停止する。これが唯一の throttle 起点の停止条件。
 - 出力レイアウトは single と同じ (`<root>/<date>_<title>_<convId8>.md` + `<root>/assets/`)。会話ごとのサブフォルダは作らない。
 - `_bulk-manifest.json` を会話完了ごとに全書き換えで保持。`status === 'done' && sourceUpdatedAt === conv.update_time` の会話は再実行時にスキップ。
 - 失敗会話は `_bulk-failed.log` に追記。
