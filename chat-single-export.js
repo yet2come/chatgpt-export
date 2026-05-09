@@ -1,5 +1,27 @@
 /**
- * ChatGPT single conversation exporter v7.17
+ * ChatGPT single conversation exporter v0.7.19
+ *
+ * v0.7.19 fixes:
+ * - 生成画像 (sediment://file_XXX) が backend ファイル API で 401 を返していた
+ *   問題を解消。ChatGPT 本体が実際に叩いているエンドポイントは
+ *     /backend-api/files/download/<id>?conversation_id=<convId>&inline=false
+ *   というパス順 (download と <id> が逆) で、さらに sediment ファイルでは
+ *   conversation_id クエリパラメータが必須だった。tryBackendDownload を
+ *   このパス形式に切り替え、file_ プレフィックスは conversation_id を、
+ *   file- プレフィックスは post_id= を付与するように変更。これで DOM
+ *   フォールバックに頼らずとも生成画像を直接取得できる。
+ *
+ * v0.7.18 fixes:
+ * - Business / Enterprise / multi-workspace 環境では backend ファイル API
+ *   (/backend-api/files/<id>/download) が Bearer トークンだけでは 401 を返す
+ *   ことがあった。起動時に /backend-api/accounts/check/v4-2023-04-27 を叩いて
+ *   account_id を抽出し、以後の全 backend 呼び出しに `ChatGPT-Account-Id`
+ *   ヘッダを付与する。Personal アカウントだけの環境では従来通り動作する。
+ * - 同一オリジン (chatgpt.com / openai.com) の署名 URL fetch を
+ *   credentials: 'omit' で叩くと estuary が 403 を返すケースに対応。
+ *   isAllowedAssetHost() で同一オリジンと判断できれば 'include' に切り替える。
+ *   single は DOM フォールバック経由で救えていたが、Cookie セッションが必要な
+ *   署名 URL を直接成功させられるようになる。
  *
  * v7.17 fixes:
  * - YAML frontmatter (title / conversation_id / url / created_at / updated_at
@@ -111,6 +133,32 @@
     return;
   }
   const headers = { Authorization: `Bearer ${token}` };
+
+  // ChatGPT-Account-Id: Business / Enterprise / multi-workspace 環境では
+  // backend ファイル API がワークスペース context を要求するため、
+  // /backend-api/accounts/check で account_id を取得して全 backend 呼び出しに付与する。
+  // 失敗しても致命ではない (Personal だけならヘッダ無しでも通る) ので silent fallback。
+  try {
+    const accRes = await fetch('/backend-api/accounts/check/v4-2023-04-27', { headers });
+    if (accRes.ok) {
+      const accJson = await accRes.json();
+      const accountsObj = accJson?.accounts || {};
+      let chosenId = null;
+      for (const [, acc] of Object.entries(accountsObj)) {
+        const id = acc?.account?.account_id || acc?.id;
+        if (!id) continue;
+        if (acc?.is_default || acc?.account?.is_default || acc?.account?.role === 'owner') {
+          chosenId = id;
+          break;
+        }
+        if (!chosenId) chosenId = id;
+      }
+      if (chosenId) {
+        headers['ChatGPT-Account-Id'] = chosenId;
+        console.log(`🪪 ChatGPT-Account-Id: ${chosenId}`);
+      }
+    }
+  } catch (_) { /* noop */ }
 
   const rootDir = await window.showDirectoryPicker({ mode: 'readwrite' });
   const assetsDir = await rootDir.getDirectoryHandle('assets', { create: true });
@@ -548,10 +596,20 @@
 
   const tryBackendDownload = async (fileId) => {
     if (!backendAvailable()) return null;
+    // ChatGPT 本体が実際に叩いているエンドポイントは
+    //   /backend-api/files/download/<id>?conversation_id=<convId>&inline=false  (sediment / 生成画像)
+    //   /backend-api/files/download/<id>?post_id=&inline=false                  (user-uploaded)
+    // パスの順序が /files/<id>/download とは逆。生成画像はさらに conversation_id が必須。
+    // 旧パス /files/<id>/download は user-uploaded には通っていたが sediment では 401 を返す。
+    const isSediment = /^file_/.test(String(fileId));
+    const qs = isSediment
+      ? `conversation_id=${encodeURIComponent(convId)}&inline=false`
+      : `post_id=&inline=false`;
+    const downloadPath = `/backend-api/files/download/${encodeURIComponent(fileId)}?${qs}`;
     let r;
     try {
       r = await fetchWithBackoff(
-        `/backend-api/files/${fileId}/download`,
+        downloadPath,
         { headers, redirect: 'follow' },
         `files/${fileId}`,
         { maxAttempts: 4, returnOnThrottle: true },
@@ -575,7 +633,11 @@
       } catch (_) {
         return null;
       }
-      const r2 = await fetch(url, { credentials: 'omit' });
+      // 同一オリジン (chatgpt.com / openai.com) の署名 URL は estuary が
+      // Cookie セッションでも認証するため credentials: 'include' でないと
+      // 403 になる。それ以外のホストは Cookie を漏らさず 'omit' のまま。
+      const sameOrigin = isAllowedAssetHost(url);
+      const r2 = await fetch(url, { credentials: sameOrigin ? 'include' : 'omit' });
       if (!r2.ok) return null;
       return r2.blob();
     }
@@ -1135,5 +1197,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v7.17: YAML frontmatter / block ref / 画像プロンプト保持の OPTIONS を追加しました');
+  console.log('   v0.7.19: ファイルダウンロードのエンドポイントを /backend-api/files/download/<id>?conversation_id=… に切り替えました');
 })();

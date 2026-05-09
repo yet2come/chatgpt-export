@@ -1,5 +1,31 @@
 /**
- * ChatGPT bulk conversation exporter v8.1
+ * ChatGPT bulk conversation exporter v0.8.3
+ *
+ * v0.8.3 fixes:
+ * - 生成画像 (sediment://file_XXX) が backend ファイル API で 401 を返して
+ *   一切保存できなかった問題を解消。ChatGPT 本体が実際に叩いている
+ *   エンドポイントは
+ *     /backend-api/files/download/<id>?conversation_id=<convId>&inline=false
+ *   というパス順 (download と <id> が逆) で、さらに sediment ファイルでは
+ *   conversation_id クエリが必須だった。downloadAssetBlob にこの URL 形式と
+ *   conversation_id 受け渡しを実装。bulk は DOM フォールバックを持たない
+ *   ため、この修正で初めて生成画像を保存できるようになる。
+ * - downloadAssetBlob は (fileId, convIdForAsset) を受け取るシグネチャに
+ *   変更。呼び出し側 (exportConversation 内のループ) は conversation の
+ *   convId を渡す。
+ *
+ * v0.8.2 fixes:
+ * - Business / Enterprise / multi-workspace 環境では backend ファイル API
+ *   が 401 を返すため画像が一切保存できない問題を修正。起動時に
+ *   /backend-api/accounts/check/v4-2023-04-27 から account_id を取得して
+ *   `ChatGPT-Account-Id` ヘッダを全 backend 呼び出しに付与する。bulk は
+ *   DOM フォールバックを持たないため、この修正で初めて Business 環境の
+ *   生成画像/添付ファイルを保存できるようになる。
+ * - 同一オリジン (chatgpt.com / openai.com) の署名 URL を
+ *   credentials: 'omit' で叩くと estuary が 403 を返すケースに対応。
+ *   isAllowedAssetHost() を bulk にも追加し、同一オリジンなら
+ *   credentials: 'include' に切り替える。これで user-uploaded 画像
+ *   (file-XXX) の estuary 取得も bulk から成功するようになる。
  *
  * v8.1 fixes:
  * - chat-single-export.js v7.17 で導入された Obsidian 連携用の出力機能を
@@ -88,6 +114,45 @@
     return;
   }
   const headers = { Authorization: `Bearer ${token}` };
+
+  // ChatGPT-Account-Id: Business / Enterprise / multi-workspace 環境では
+  // backend ファイル API がワークスペース context を要求するため、
+  // /backend-api/accounts/check で account_id を取得して全 backend 呼び出しに付与する。
+  // bulk は対象会話の DOM にアクセスできず DOM フォールバックも無いため、
+  // 認証ヘッダの完全性が画像取得成功率を直接決める。失敗しても致命ではないので silent fallback。
+  try {
+    const accRes = await fetch('/backend-api/accounts/check/v4-2023-04-27', { headers });
+    if (accRes.ok) {
+      const accJson = await accRes.json();
+      const accountsObj = accJson?.accounts || {};
+      let chosenId = null;
+      for (const [, acc] of Object.entries(accountsObj)) {
+        const id = acc?.account?.account_id || acc?.id;
+        if (!id) continue;
+        if (acc?.is_default || acc?.account?.is_default || acc?.account?.role === 'owner') {
+          chosenId = id;
+          break;
+        }
+        if (!chosenId) chosenId = id;
+      }
+      if (chosenId) {
+        headers['ChatGPT-Account-Id'] = chosenId;
+        console.log(`🪪 ChatGPT-Account-Id: ${chosenId}`);
+      }
+    }
+  } catch (_) { /* noop */ }
+
+  const isAllowedAssetHost = (url) => {
+    try {
+      const u = new URL(url, location.origin);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      return u.hostname === location.hostname
+        || u.hostname.endsWith('.openai.com')
+        || u.hostname.endsWith('.chatgpt.com');
+    } catch (_) {
+      return false;
+    }
+  };
 
   const rootDir = await window.showDirectoryPicker({ mode: 'readwrite' });
   const assetsDir = await rootDir.getDirectoryHandle('assets', { create: true });
@@ -576,13 +641,23 @@
   // 終了条件は (a) 成功 (b) 4xx/5xx 等の恒久失敗 (c) waitForCooldown が
   // maxBatchPauseMs 超過で throw、の 3 つのみ。429/503 が続く限り再試行する。
 
-  const downloadAssetBlob = async (fileId) => {
+  const downloadAssetBlob = async (fileId, convIdForAsset) => {
+    // ChatGPT 本体が実際に叩いているエンドポイントは
+    //   /backend-api/files/download/<id>?conversation_id=<convId>&inline=false  (sediment / 生成画像)
+    //   /backend-api/files/download/<id>?post_id=&inline=false                  (user-uploaded)
+    // パスの順序が /files/<id>/download とは逆。生成画像はさらに conversation_id が必須。
+    // 旧パス /files/<id>/download は user-uploaded には通っていたが sediment では 401 を返す。
+    const isSediment = /^file_/.test(String(fileId));
+    const qs = isSediment && convIdForAsset
+      ? `conversation_id=${encodeURIComponent(convIdForAsset)}&inline=false`
+      : `post_id=&inline=false`;
+    const downloadPath = `/backend-api/files/download/${encodeURIComponent(fileId)}?${qs}`;
     while (true) {
       await waitForCooldown();
       let r;
       try {
         r = await fetchWithBackoff(
-          `/backend-api/files/${fileId}/download`,
+          downloadPath,
           { headers, redirect: 'follow' },
           `files/${fileId}`,
           { maxAttempts: 4, returnOnThrottle: true },
@@ -606,7 +681,11 @@
         } catch (_) {
           return null;
         }
-        const r2 = await fetch(url, { credentials: 'omit' });
+        // 同一オリジン (chatgpt.com / openai.com) の署名 URL は estuary が
+        // Cookie セッションでも認証するため credentials: 'include' でないと
+        // 403 になる。それ以外のホストは Cookie を漏らさず 'omit' のまま。
+        const sameOrigin = isAllowedAssetHost(url);
+        const r2 = await fetch(url, { credentials: sameOrigin ? 'include' : 'omit' });
         if (!r2.ok) return null;
         return r2.blob();
       }
@@ -743,7 +822,7 @@
     for (const [base, asset] of assets) {
       let blob = null;
       try {
-        blob = await downloadAssetBlob(base);
+        blob = await downloadAssetBlob(base, convId);
       } catch (e) {
         if (/バッチ累積待機/.test(String(e?.message || ''))) throw e;
         console.warn(`  ⚠️ [${convId8}] backend ${base}: ${e.message}`);
@@ -1143,5 +1222,5 @@
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v8.1: YAML frontmatter / block ref / 画像プロンプト保持の OPTIONS を bulk にも反映しました');
+  console.log('   v0.8.3: ファイルダウンロードのエンドポイントを /backend-api/files/download/<id>?conversation_id=… に切り替えました');
 })();
