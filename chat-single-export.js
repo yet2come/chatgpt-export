@@ -1,5 +1,24 @@
 /**
- * ChatGPT single conversation exporter v7.16
+ * ChatGPT single conversation exporter v7.17
+ *
+ * v7.17 fixes:
+ * - YAML frontmatter (title / conversation_id / url / created_at / updated_at
+ *   / exported_at / model / message_count / tags) is now emitted at the top
+ *   of the Markdown so Obsidian Dataview and similar tools can index
+ *   conversations. The legacy heading + bullet block is kept underneath for
+ *   plain-Markdown readers, so existing exports are not broken.
+ * - Three new opt-in OPTIONS for Obsidian-flavored output:
+ *   - emitBlockRefs: append `^msg-yymmdd-HHMMSS` after each rendered message
+ *     so other notes can embed a single turn with `![[file#^id]]`.
+ *   - obsidianImageWidth: false | number — when a positive number, image alt
+ *     text becomes `Image|<width>` to control inline rendering size in
+ *     Obsidian. Off by default because it deviates from CommonMark alt
+ *     semantics.
+ *   - includeImagePrompts: when true, image-generation tool calls
+ *     (dalle.text2im etc.) emit their JSON prompt as a fenced block before
+ *     the resulting image. Off by default to keep prose clean.
+ * - emitFrontmatter is on by default; set it to false to restore the
+ *   pre-v7.17 plain-heading-only output.
  *
  * v7.16 fixes:
  * - Output directory is renamed from `images/` to `assets/` so that
@@ -60,6 +79,10 @@
     allowLooseQueryId: false,
     recursiveMessageAssetScan: true,
     domTurnPositioning: true,
+    emitFrontmatter: true,
+    emitBlockRefs: false,
+    obsidianImageWidth: false,
+    includeImagePrompts: false,
   };
 
   if (!window.showDirectoryPicker) {
@@ -684,6 +707,25 @@
     const pad = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   };
+  const blockRefId = (ts) => {
+    if (!ts) return null;
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    const yy = String(d.getFullYear()).slice(-2);
+    return `msg-${yy}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  };
+  const isoFromEpoch = (ts) => {
+    if (!ts) return '';
+    return new Date(ts * 1000).toISOString();
+  };
+  const yamlEscape = (s) => {
+    const text = String(s == null ? '' : s);
+    if (!text) return '""';
+    if (/[:#\[\]{}&*!|>'"%@`,\n]/.test(text) || /^\s|\s$/.test(text)) {
+      return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+    return text;
+  };
   const linearize = (mapping, current) => {
     const chain = [];
     let id = current;
@@ -740,8 +782,12 @@
     renderedAssetBases.add(base);
     const path = `assets/${base}.${ext}`;
     const linkLabel = (assetMeta.get(base) || {}).filename || `${base}.${ext}`;
+    const widthOpt = OPTIONS.obsidianImageWidth;
+    const imgAlt = (typeof widthOpt === 'number' && Number.isFinite(widthOpt) && widthOpt > 0)
+      ? `Image|${Math.floor(widthOpt)}`
+      : '';
     const ref = isPreviewableImageExt(ext)
-      ? `![](${path})`
+      ? `![${imgAlt}](${path})`
       : `[添付ファイル: ${escapeMdLinkText(linkLabel)}](${path})`;
     return fragment ? `${ref}\n_(ページ指定: ${fragment.slice(1)})_` : ref;
   };
@@ -921,15 +967,25 @@
 
     if (role === 'assistant' && recipient !== 'all') {
       const doc = renderAssistantDocumentMessage(msg);
-      if (!doc) return null;
-      parts.push(doc.body);
-      appendAssetRefs();
-      for (const r of renderExternalLinks(msg)) parts.push(r);
-      const body = parts.filter(p => p && p.trim()).join('\n\n');
-      if (!body.trim()) return null;
-      let header = `### 📝 Document${doc.title ? `: ${cleanHeading(doc.title)}` : ''}`;
-      if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
-      return `${header}\n\n${body}`;
+      if (doc) {
+        parts.push(doc.body);
+        appendAssetRefs();
+        for (const r of renderExternalLinks(msg)) parts.push(r);
+        const body = parts.filter(p => p && p.trim()).join('\n\n');
+        if (!body.trim()) return null;
+        let header = `### 📝 Document${doc.title ? `: ${cleanHeading(doc.title)}` : ''}`;
+        if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
+        return `${header}\n\n${body}`;
+      }
+      if (OPTIONS.includeImagePrompts && /(?:^|\.)(?:dalle|image_gen|image_generator)/i.test(recipient)) {
+        const promptText = messageRawTextParts(msg).map(t => String(t || '').trim()).filter(Boolean).join('\n\n');
+        if (!promptText) return null;
+        let header = '### 🎨 生成プロンプト';
+        if (msg.create_time) header += `  _${fmtTime(msg.create_time)}_`;
+        const fence = codeFenceFor(promptText);
+        return `${header}\n\n${fence}json\n${promptText}\n${fence}`;
+      }
+      return null;
     }
 
     if (role === 'tool') {
@@ -993,22 +1049,44 @@
   const cTime = convo.create_time;
   const uTime = convo.update_time;
   const model = convo.default_model_slug || '(モデル不明)';
-  const front = `# ${headingTitle}\n\n`
-    + `- **作成日時:** ${fmtTime(cTime)}\n`
-    + `- **最終更新:** ${fmtTime(uTime)}\n`
-    + `- **モデル:** ${model}\n`
-    + `- **会話ID:** ${convo.conversation_id}\n\n---\n\n`;
   const chain = linearize(convo.mapping, convo.current_node);
   const blocks = [];
   let renderTurnIndex = 0;
   for (const node of chain) {
     const block = renderMessage(node.message, renderTurnIndex);
     if (block) {
-      blocks.push(block);
+      let body = block;
+      if (OPTIONS.emitBlockRefs) {
+        const ref = blockRefId(node.message?.create_time);
+        if (ref) body = `${block}\n\n^${ref}`;
+      }
+      blocks.push(body);
       renderTurnIndex++;
     }
   }
-  let md = front + blocks.join('\n\n---\n\n') + '\n';
+  let frontmatter = '';
+  if (OPTIONS.emitFrontmatter) {
+    const lines = [
+      '---',
+      `title: ${yamlEscape(headingTitle)}`,
+      `conversation_id: ${yamlEscape(convo.conversation_id || convId)}`,
+      `url: ${yamlEscape(`https://chatgpt.com/c/${convId}`)}`,
+    ];
+    if (cTime) lines.push(`created_at: ${yamlEscape(isoFromEpoch(cTime))}`);
+    if (uTime) lines.push(`updated_at: ${yamlEscape(isoFromEpoch(uTime))}`);
+    lines.push(`exported_at: ${yamlEscape(new Date().toISOString())}`);
+    if (model) lines.push(`model: ${yamlEscape(model)}`);
+    lines.push(`message_count: ${blocks.length}`);
+    lines.push('tags: [ChatGPT]');
+    lines.push('---', '');
+    frontmatter = lines.join('\n') + '\n';
+  }
+  const headerSection = `# ${headingTitle}\n\n`
+    + `- **作成日時:** ${fmtTime(cTime)}\n`
+    + `- **最終更新:** ${fmtTime(uTime)}\n`
+    + `- **モデル:** ${model}\n`
+    + `- **会話ID:** ${convo.conversation_id}\n\n---\n\n`;
+  let md = frontmatter + headerSection + blocks.join('\n\n---\n\n') + '\n';
 
   const domOnly = [];
   for (const [base, a] of assets) {
@@ -1057,5 +1135,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v7.16: 出力ディレクトリを images/ から assets/ に変更しました');
+  console.log('   v7.17: YAML frontmatter / block ref / 画像プロンプト保持の OPTIONS を追加しました');
 })();
