@@ -1,5 +1,17 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.14
+ * ChatGPT bulk conversation exporter v0.8.15
+ *
+ * v0.8.15 fixes (conversation throttle decay の実効化):
+ * - conversation throttle 通算カウンタの減衰条件を 25 件連続成功から
+ *   5 件成功蓄積へ変更。
+ *   実機ログでは throttle 間の成功 burst が 0〜3 件程度で、25 件には到達せず
+ *   v0.8.14 の減衰が一度も発火していなかった。
+ * - `bumpAdaptiveDelay()` では delay 制御用の連続成功カウンタだけをリセットし、
+ *   throttle 減衰用カウンタは run 全体で蓄積する。throttle 発生のたびに
+ *   throttle 減衰用カウンタを 0 に戻すと、小さな成功 burst が捨てられ
+ *   通算カウンタが monotonic に近い挙動へ戻っていた。
+ * - conversation cooldown ladder を 60 → 90 → 120 → 180 秒から
+ *   60 → 90 → 120 → 180 → 240 → 300 秒へ拡張し、pause 直前の余裕を増やした。
  *
  * v0.8.14 fixes (取得診断と Office MIME):
  * - `guessExt` に Office Open XML (docx/pptx/xlsx) と旧 MS Office (doc/ppt/xls) の
@@ -325,15 +337,15 @@
   const ADAPTIVE_DELAY_MAX_MS = 15000;
   const ADAPTIVE_DECAY_AFTER = 10;
   // throttle counter (通算 429 回数) は v0.8.13 まで monotonic で、5 回到達で必ず pause していた。
-  // v0.8.14 で連続成功 N 件で 1 段階ずつ減衰する仕組みを追加。
-  // delay 減衰 (10 件) より長めに取ることで、レート安定が確認できてから throttle 余裕を回復する。
-  const THROTTLE_COUNT_DECAY_AFTER = 25;
+  // v0.8.14 の 25 件閾値は実機の小さな成功 burst では発火しなかったため、
+  // v0.8.15 では 5 件単位で蓄積成功を throttle 余裕へ戻す。
+  const THROTTLE_COUNT_DECAY_AFTER = 5;
   let adaptiveDelayMs = OPTIONS.perConversationDelayMs;
   let consecutiveSuccessForDelay = 0;
-  let consecutiveSuccessForThrottle = 0;
+  let successesSinceThrottleDecay = 0;
   const noteAdaptiveSuccess = () => {
     consecutiveSuccessForDelay++;
-    consecutiveSuccessForThrottle++;
+    successesSinceThrottleDecay++;
     if (consecutiveSuccessForDelay >= ADAPTIVE_DECAY_AFTER && adaptiveDelayMs > OPTIONS.perConversationDelayMs) {
       const next = Math.max(OPTIONS.perConversationDelayMs, Math.round(adaptiveDelayMs * 0.7));
       if (next !== adaptiveDelayMs) {
@@ -342,11 +354,11 @@
       }
       consecutiveSuccessForDelay = 0;
     }
-    if (consecutiveSuccessForThrottle >= THROTTLE_COUNT_DECAY_AFTER && conversationThrottleCount > 0) {
+    if (successesSinceThrottleDecay >= THROTTLE_COUNT_DECAY_AFTER && conversationThrottleCount > 0) {
       const before = conversationThrottleCount;
       conversationThrottleCount--;
-      console.log(`  📉 conversation throttle 通算: ${before} → ${conversationThrottleCount} 回 (連続成功 ${THROTTLE_COUNT_DECAY_AFTER} 件)`);
-      consecutiveSuccessForThrottle = 0;
+      console.log(`  📉 conversation throttle 通算: ${before} → ${conversationThrottleCount} 回 (成功蓄積 ${THROTTLE_COUNT_DECAY_AFTER} 件)`);
+      successesSinceThrottleDecay = 0;
     }
   };
 
@@ -356,7 +368,7 @@
   let totalFilePauseMs = 0;
   let totalBatchPauseMs = 0;
   const FILE_COOLDOWN_BASE_MS = 60000;
-  const CONVERSATION_COOLDOWN_LADDER_MS = [60000, 90000, 120000, 180000];
+  const CONVERSATION_COOLDOWN_LADDER_MS = [60000, 90000, 120000, 180000, 240000, 300000];
   let conversationThrottleCount = 0;
 
   const cooldownLabel = (kind) => kind === 'file' ? 'file' : 'conv';
@@ -377,7 +389,6 @@
       console.log(`  📈 会話間 delay を ${adaptiveDelayMs}ms に引き上げ`);
     }
     consecutiveSuccessForDelay = 0;
-    consecutiveSuccessForThrottle = 0;
   };
 
   const noteConversationThrottle = (retryAfterMs, status = 429) => {
@@ -1815,5 +1826,5 @@
     console.log(`  ℹ️ queue 補完分のうち ${queueOnlyDoneSkipped} 件が done スキップ — 次回 list が完全取得されたタイミングで更新検知されます`);
   }
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 一時停止 ${pausedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.14: 取得失敗の HTTP status をログへ + _bulk-asset-failed.log + Office MIME (docx/pptx/xlsx) 判定 + throttle 通算カウンタの連続成功減衰');
+  console.log('   v0.8.15: throttle 減衰を5件単位に短縮 + throttle成功カウンタをdelay制御から分離 + cooldown ladderを6段階化');
 })();
