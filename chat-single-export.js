@@ -1,5 +1,14 @@
 /**
- * ChatGPT single conversation exporter v0.7.20
+ * ChatGPT single conversation exporter v0.7.21
+ *
+ * v0.7.21 fixes (取得診断と Office MIME):
+ * - Office 添付ファイルの MIME を guessExt に追加し、docx / pptx / xlsx
+ *   および旧 Office 形式 doc / ppt / xls を .bin 化せず保存できるようにした。
+ *   MIME が欠落した ZIP コンテナは ZIP magic で zip として保存する。
+ * - backend / DOM download の失敗理由を `{ blob, reason }` で保持し、
+ *   取得不可ログに `backend=HTTP 404 / dom=no_dom_url` のように併記する。
+ *   single は 1 会話単位の対話実行なので失敗ログファイルは作らない。
+ * - HTML 応答や bin skip も、コンソール上で原因が分かるように出力する。
  *
  * v0.7.20 fixes (重要 — データ消失バグ修正):
  * - ファイル名末尾の衝突回避 ID を UUID 先頭 8 文字 → 末尾 8 文字 に変更。
@@ -589,16 +598,23 @@
     if (mt.includes('tab-separated-values') || mt.includes('tsv')) return 'tsv';
     if (mt.includes('json')) return 'json';
     if (mt.includes('html')) return 'html';
-    if (mime?.includes('png')) return 'png';
-    if (mime?.includes('jpeg') || mime?.includes('jpg')) return 'jpg';
-    if (mime?.includes('webp')) return 'webp';
-    if (mime?.includes('gif')) return 'gif';
-    if (mime?.includes('pdf')) return 'pdf';
+    if (mt.includes('png')) return 'png';
+    if (mt.includes('jpeg') || mt.includes('jpg')) return 'jpg';
+    if (mt.includes('webp')) return 'webp';
+    if (mt.includes('gif')) return 'gif';
+    if (mt.includes('pdf')) return 'pdf';
+    if (mt.includes('officedocument.wordprocessingml.document')) return 'docx';
+    if (mt.includes('officedocument.presentationml.presentation')) return 'pptx';
+    if (mt.includes('officedocument.spreadsheetml.sheet')) return 'xlsx';
+    if (mt === 'application/msword') return 'doc';
+    if (mt === 'application/vnd.ms-powerpoint') return 'ppt';
+    if (mt === 'application/vnd.ms-excel') return 'xls';
     if (head[0] === 0x89 && head[1] === 0x50) return 'png';
     if (head[0] === 0xff && head[1] === 0xd8) return 'jpg';
     if (head[0] === 0x52 && head[1] === 0x49) return 'webp';
     if (head[0] === 0x47 && head[1] === 0x49) return 'gif';
     if (head[0] === 0x25 && head[1] === 0x50) return 'pdf';
+    if (head[0] === 0x50 && head[1] === 0x4b && [0x03, 0x05, 0x07].includes(head[2])) return 'zip';
     const text = String(sampleText || '').replace(/^\uFEFF/, '');
     const trimmed = text.trimStart();
     if (/^[\[{]/.test(trimmed)) return 'json';
@@ -609,8 +625,12 @@
     return 'bin';
   };
 
+  const downloadResult = (blob, reason = '') => ({ blob, reason });
+  const downloadFailure = (reason) => downloadResult(null, reason);
+  const reasonFromError = (e) => String(e?.message || e || 'unknown_error').replace(/\s+/g, ' ').trim();
+
   const tryBackendDownload = async (fileId) => {
-    if (!backendAvailable()) return null;
+    if (!backendAvailable()) return downloadFailure('backend_cooldown');
     // ChatGPT 本体が実際に叩いているエンドポイントは
     //   /backend-api/files/download/<id>?conversation_id=<convId>&inline=false  (sediment / 生成画像)
     //   /backend-api/files/download/<id>?post_id=&inline=false                  (user-uploaded)
@@ -629,46 +649,57 @@
         `files/${fileId}`,
         { maxAttempts: 4, returnOnThrottle: true },
       );
-    } catch (_) {
-      return null;
+    } catch (e) {
+      return downloadFailure(`fetch_error:${reasonFromError(e)}`);
     }
     if (r.status === 429 || r.status === 503) {
       noteBackendThrottle(parseRetryAfter(r.headers.get('retry-after')));
-      return null;
+      return downloadFailure(`HTTP ${r.status}`);
     }
-    if (!r.ok) return null;
+    if (!r.ok) return downloadFailure(`HTTP ${r.status}`);
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('application/json')) {
       const j = await r.json().catch(() => null);
+      if (!j) return downloadFailure('invalid_json');
       const url = j?.download_url || j?.url || j?.file_url || j?.signed_url;
-      if (!url) return null;
+      if (!url) return downloadFailure('no_signed_url');
       try {
         const u = new URL(url);
-        if (u.protocol !== 'https:') return null;
+        if (u.protocol !== 'https:') return downloadFailure(`invalid_url:${u.protocol}`);
       } catch (_) {
-        return null;
+        return downloadFailure('invalid_url');
       }
       // 同一オリジン (chatgpt.com / openai.com) の署名 URL は estuary が
       // Cookie セッションでも認証するため credentials: 'include' でないと
       // 403 になる。それ以外のホストは Cookie を漏らさず 'omit' のまま。
       const sameOrigin = isAllowedAssetHost(url);
-      const r2 = await fetch(url, { credentials: sameOrigin ? 'include' : 'omit' });
-      if (!r2.ok) return null;
-      return r2.blob();
+      let r2;
+      try {
+        r2 = await fetch(url, { credentials: sameOrigin ? 'include' : 'omit' });
+      } catch (e) {
+        return downloadFailure(`signed_fetch_error:${reasonFromError(e)}`);
+      }
+      if (!r2.ok) return downloadFailure(`signed_HTTP ${r2.status}`);
+      return downloadResult(await r2.blob());
     }
-    return r.blob();
+    return downloadResult(await r.blob());
   };
 
   const tryDomDownload = async (base) => {
     const url = domByBase.get(base);
-    if (!url) return null;
+    if (!url) return downloadFailure('no_dom_url');
     if (!isAllowedAssetHost(url)) {
       console.warn(`  ⚠️ DOM画像URLのホスト不許可のためスキップ: ${url}`);
-      return null;
+      return downloadFailure('dom_host_blocked');
     }
-    const r = await fetch(url, { credentials: 'include' });
-    if (!r.ok) return null;
-    return r.blob();
+    let r;
+    try {
+      r = await fetch(url, { credentials: 'include' });
+    } catch (e) {
+      return downloadFailure(`dom_fetch_error:${reasonFromError(e)}`);
+    }
+    if (!r.ok) return downloadFailure(`dom_HTTP ${r.status}`);
+    return downloadResult(await r.blob());
   };
 
   const extMap = {};
@@ -679,30 +710,42 @@
   for (const [base, asset] of assets) {
     let blob = null;
     let via = '';
+    let backendReason = '';
+    let domReason = '';
     try {
-      blob = await tryBackendDownload(base);
+      const backendResult = await tryBackendDownload(base);
+      blob = backendResult.blob;
+      backendReason = backendResult.reason;
       if (blob) via = 'backend';
     } catch (e) {
+      backendReason = `exception:${reasonFromError(e)}`;
       console.warn(`  ⚠️ backend ${base}: ${e.message}`);
     }
     if (!blob) {
       try {
-        blob = await tryDomDownload(base);
+        const domResult = await tryDomDownload(base);
+        blob = domResult.blob;
+        domReason = domResult.reason;
         if (blob) via = 'dom';
       } catch (e) {
+        domReason = `exception:${reasonFromError(e)}`;
         console.warn(`  ⚠️ dom ${base}: ${e.message}`);
       }
     }
     if (!blob) {
       failed++;
-      console.warn(`  ❌ ${base}${asset.composite ? ' (composite)' : ''} [${asset.source}]: 取得不可`);
+      const reasons = [
+        backendReason ? `backend=${backendReason}` : '',
+        domReason ? `dom=${domReason}` : '',
+      ].filter(Boolean).join(' / ');
+      console.warn(`  ❌ ${base}${asset.composite ? ' (composite)' : ''} [${asset.source}]: 取得不可${reasons ? ` (${reasons})` : ''}`);
       continue;
     }
     const headBytes = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
     const head = headBytes.slice(0, 8);
     if (head[0] === 0x3c) {
       skipped++;
-      console.log(`  ⏭️ ${base} (HTML応答)`);
+      console.log(`  ⏭️ ${base} (HTML応答: ${via || 'unknown'}=html_response)`);
       continue;
     }
     const sampleText = new TextDecoder('utf-8').decode(headBytes);
@@ -712,6 +755,7 @@
       console.warn(`  ⚠️ ${base}: 拡張子不明 (mime=${blob.type || 'unknown'} size=${blob.size}). binBehavior=${OPTIONS.binBehavior}`);
       if (OPTIONS.binBehavior === 'skip') {
         skipped++;
+        console.log(`  ⏭️ ${base} (bin skip: mime=${blob.type || 'unknown'} size=${blob.size})`);
         continue;
       }
     }
@@ -1212,5 +1256,5 @@
   console.log(`\n🎉 完了: ${fname}`);
   console.log(`   asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
   console.log(`   asset 内訳: JSON由来 ${jsonAssetCount} + DOM昇格 ${promoted}`);
-  console.log('   v0.7.20: ファイル名末尾の ID を UUID 先頭 8 文字 → 末尾 8 文字に変更 (同名ファイル上書きでのデータ消失を防止)');
+  console.log('   v0.7.21: Office MIME / ZIP 判定追加 + backend/DOM 取得失敗理由をコンソール表示');
 })();
