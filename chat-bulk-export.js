@@ -1,5 +1,21 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.11
+ * ChatGPT bulk conversation exporter v0.8.12
+ *
+ * v0.8.12 fixes (cooldown 戦略の本格修正):
+ * - backend cooldown 機構が事実上空振りしていた問題を解消。fetchWithBackoff の
+ *   バックオフ sleep (5+8+13+20 ≈ 46 秒) の合計が、cooldown の最低時間 30 秒を
+ *   上回るため、会話完了後に waitForCooldown を呼んでも cooldown は既に満了
+ *   している、という構造だった。実機で 631 件中 400 件で累積待機 5 分超過に
+ *   なるまで、ほぼ全会話で 429 を踏み続けていた。
+ *   修正:
+ *   1. backend cooldown が active な間は固定バックオフではなく waitForCooldown
+ *      で待機 (会話内バックオフループ自体が cooldown を尊重する)
+ *   2. cooldown 最低時間を 30 秒 → 60 秒に延長 (実測で quota が 30 秒では
+ *      回復しないため)
+ *   3. OPTIONS.maxBatchPauseMs を 5 分 → 15 分に拡大 (1 回の Console セッション
+ *      で長く粘れるように)
+ *   これで cooldown 発動後は次の会話開始まで実効的に 60 秒以上空き、サーバ側
+ *   quota の回復を待ってから処理を再開する動きになる。
  *
  * v0.8.11 fixes (重要 — データ消失バグ修正):
  * - ファイル名末尾の衝突回避 ID を UUID 先頭 8 文字 → 末尾 8 文字 に変更。
@@ -170,7 +186,7 @@
     //   { type: 'idList', ids: ['xxxx-...', 'yyyy-...'] }
     perConversationDelayMs: 1500,
     resume: true,
-    maxBatchPauseMs: 5 * 60 * 1000,
+    maxBatchPauseMs: 15 * 60 * 1000,
   };
 
   if (!window.showDirectoryPicker) {
@@ -274,8 +290,11 @@
 
   let backendCooldownUntil = 0;
   let totalBatchPauseMs = 0;
+  // 30 秒では quota が回復しないことが実機で判明 (v0.8.5〜v0.8.8 のログ)。
+  // 60 秒に延長してサーバ側の rate-limit window を素直に待つ。
+  const COOLDOWN_BASE_MS = 60000;
   const noteBackendThrottle = (retryAfterMs) => {
-    const base = Math.max(retryAfterMs ?? 0, 30000);
+    const base = Math.max(retryAfterMs ?? 0, COOLDOWN_BASE_MS);
     backendCooldownUntil = Math.max(backendCooldownUntil, now() + base);
     console.log(`  🧊 backend クールダウン: 次回 ${Math.round((backendCooldownUntil - now()) / 1000)}秒後まで使用しません`);
     const bumped = Math.min(ADAPTIVE_DELAY_MAX_MS, Math.max(adaptiveDelayMs * 2, OPTIONS.perConversationDelayMs * 2));
@@ -319,9 +338,19 @@
         const ra = parseRetryAfter(res.headers.get('retry-after'));
         if (noteThrottle) noteBackendThrottle(ra);
         if (returnOnThrottle) return res;
+        if (attempt + 1 >= maxAttempts) return res;
+        // backend cooldown が active なら、固定バックオフ秒ではなく cooldown 解除を待つ。
+        // これがないと 5+8+13+20 ≈ 46秒のバックオフ中に 30〜60秒の cooldown が
+        // 満了してしまい、cooldown 機構が事実上空振りする (v0.8.5〜v0.8.8 で観測)。
+        // waitForCooldown は累積待機が maxBatchPauseMs を超えたら throw するので、
+        // バッチ停止条件は引き続き機能する。
+        if (!backendAvailable()) {
+          console.log(`  ⏳ ${res.status} ${label}: クールダウン解除を待機 (${attempt + 1}/${maxAttempts})`);
+          await waitForCooldown();
+          continue;
+        }
         const wait = Math.max(MIN_WAIT_MS, ra != null ? ra : Math.min(60000, BACKOFF_BASE_MS * Math.pow(1.6, attempt)));
         console.log(`  ⏳ ${res.status} ${label}: ${Math.round(wait / 1000)}秒待機 (${attempt + 1}/${maxAttempts})`);
-        if (attempt + 1 >= maxAttempts) return res;
         await sleep(wait);
         continue;
       }
@@ -1370,5 +1399,5 @@
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.11: ファイル名末尾の ID を UUID 先頭 8 文字 → 末尾 8 文字に変更 (同名ファイル上書きでのデータ消失を防止)');
+  console.log('   v0.8.12: cooldown 機構の本格修正 — バックオフ中も cooldown 尊重 + 最低 60 秒 + maxBatchPauseMs 15 分');
 })();
