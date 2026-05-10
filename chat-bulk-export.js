@@ -1,5 +1,26 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.13
+ * ChatGPT bulk conversation exporter v0.8.14
+ *
+ * v0.8.14 fixes (取得診断と Office MIME):
+ * - `guessExt` に Office Open XML (docx/pptx/xlsx) と旧 MS Office (doc/ppt/xls) の
+ *   MIME 判定を追加。さらに ZIP マジックバイト (PK\x03\x04) で `.zip` を識別する
+ *   フォールバックを入れ、backend が Content-Type を欠落させるケース (v0.8.13
+ *   ログ #327: `mime=multipart/form-data` で実体は OOXML) でも `.bin` 化を回避。
+ * - `downloadAssetBlob` の戻り値を `{ blob, reason }` に変更。失敗時の HTTP
+ *   ステータス (`HTTP 404` / `signed_HTTP 403` / `no_signed_url` /
+ *   `invalid_url` / `fetch_error:...`) を呼び出し側まで伝搬し、コンソールに
+ *   `❌ 取得不可 (HTTP 404)` 形式で出す。原因切り分けが格段に楽になる。
+ * - `_bulk-asset-failed.log` を新設。会話完了時に asset 失敗を TSV 1 行で追記
+ *   (timestamp / convId / assetBase / source / composite フラグ / reason)。
+ *   bulk 完了後に「single で個別再取得すべき会話」を機械可読で抽出可能。
+ *   会話単位失敗の `_bulk-failed.log` とは別ファイル。
+ *   reason は HTTP ステータス系のほかに `HTML_response` (backend がログイン HTML を
+ *   返したケース) と `bin_skip:<mime>` (`OPTIONS.binBehavior === 'skip'` で
+ *   拡張子不明をスキップしたケース) も含む。これらは extMap に入らず Markdown
+ *   側で「添付ファイル取得不可」になるため、再取得対象として記録する。
+ * - conversation throttle 通算カウンタの連続成功減衰を追加。25 件連続成功で
+ *   1 段階ずつ減衰し、4 段階 ladder 中の余裕を回復する。v0.8.13 までは monotonic
+ *   で、Run 内 5 回到達で必ず pause していた。
  *
  * v0.8.13 fixes (resume 時の list 揺らぎ対策):
  * - `/backend-api/conversations` の取得件数が resume 実行ごとに揺れる問題に
@@ -219,6 +240,7 @@
   const MANIFEST_NAME = '_bulk-manifest.json';
   const QUEUE_NAME = '_bulk-queue.json';
   const FAILED_LOG_NAME = '_bulk-failed.log';
+  const ASSET_FAILED_LOG_NAME = '_bulk-asset-failed.log';
   const PAGE_LIMIT = 100;
 
   class BatchPauseError extends Error {
@@ -302,17 +324,29 @@
   const BACKOFF_BASE_MS = 5000;
   const ADAPTIVE_DELAY_MAX_MS = 15000;
   const ADAPTIVE_DECAY_AFTER = 10;
+  // throttle counter (通算 429 回数) は v0.8.13 まで monotonic で、5 回到達で必ず pause していた。
+  // v0.8.14 で連続成功 N 件で 1 段階ずつ減衰する仕組みを追加。
+  // delay 減衰 (10 件) より長めに取ることで、レート安定が確認できてから throttle 余裕を回復する。
+  const THROTTLE_COUNT_DECAY_AFTER = 25;
   let adaptiveDelayMs = OPTIONS.perConversationDelayMs;
-  let consecutiveSuccess = 0;
+  let consecutiveSuccessForDelay = 0;
+  let consecutiveSuccessForThrottle = 0;
   const noteAdaptiveSuccess = () => {
-    consecutiveSuccess++;
-    if (consecutiveSuccess >= ADAPTIVE_DECAY_AFTER && adaptiveDelayMs > OPTIONS.perConversationDelayMs) {
+    consecutiveSuccessForDelay++;
+    consecutiveSuccessForThrottle++;
+    if (consecutiveSuccessForDelay >= ADAPTIVE_DECAY_AFTER && adaptiveDelayMs > OPTIONS.perConversationDelayMs) {
       const next = Math.max(OPTIONS.perConversationDelayMs, Math.round(adaptiveDelayMs * 0.7));
       if (next !== adaptiveDelayMs) {
         adaptiveDelayMs = next;
         console.log(`  📉 会話間 delay を ${adaptiveDelayMs}ms に減衰`);
       }
-      consecutiveSuccess = 0;
+      consecutiveSuccessForDelay = 0;
+    }
+    if (consecutiveSuccessForThrottle >= THROTTLE_COUNT_DECAY_AFTER && conversationThrottleCount > 0) {
+      const before = conversationThrottleCount;
+      conversationThrottleCount--;
+      console.log(`  📉 conversation throttle 通算: ${before} → ${conversationThrottleCount} 回 (連続成功 ${THROTTLE_COUNT_DECAY_AFTER} 件)`);
+      consecutiveSuccessForThrottle = 0;
     }
   };
 
@@ -342,7 +376,8 @@
       adaptiveDelayMs = bumped;
       console.log(`  📈 会話間 delay を ${adaptiveDelayMs}ms に引き上げ`);
     }
-    consecutiveSuccess = 0;
+    consecutiveSuccessForDelay = 0;
+    consecutiveSuccessForThrottle = 0;
   };
 
   const noteConversationThrottle = (retryAfterMs, status = 429) => {
@@ -672,6 +707,20 @@
     await w.write(prev + line + '\n');
     await w.close();
   };
+  // asset 単位の失敗ログ。会話完了時にまとめて 1 回だけ書き込み、I/O を抑える
+  // (会話あたり数十件失敗するケースがあるため毎件 read-write は重い)。
+  const appendAssetFailedLog = async (lines) => {
+    if (!Array.isArray(lines) || !lines.length) return;
+    const fh = await rootDir.getFileHandle(ASSET_FAILED_LOG_NAME, { create: true });
+    let prev = '';
+    try {
+      const f = await fh.getFile();
+      prev = await f.text();
+    } catch (_) {}
+    const w = await fh.createWritable();
+    await w.write(prev + lines.join('\n') + '\n');
+    await w.close();
+  };
   const pauseBatch = async ({ manifest, queue, reason }) => {
     console.warn(`⏸️  ${reason} — 同フォルダで resume してください`);
     if (queue) {
@@ -818,11 +867,25 @@
     if (mime?.includes('webp')) return 'webp';
     if (mime?.includes('gif')) return 'gif';
     if (mime?.includes('pdf')) return 'pdf';
+    // Office Open XML (OOXML / ZIP-backed). MIME 一致が最も確実。
+    if (mt.includes('officedocument.wordprocessingml.document')) return 'docx';
+    if (mt.includes('officedocument.presentationml.presentation')) return 'pptx';
+    if (mt.includes('officedocument.spreadsheetml.sheet')) return 'xlsx';
+    // 旧 MS Office (CFB/OLE2)。MIME のみで判定。CFB マジックバイトは Excel/Word/PPT 共通で
+    // 中身を見ないと識別不能なので head 判定はしない。
+    if (mt === 'application/msword') return 'doc';
+    if (mt === 'application/vnd.ms-powerpoint') return 'ppt';
+    if (mt === 'application/vnd.ms-excel') return 'xls';
     if (head[0] === 0x89 && head[1] === 0x50) return 'png';
     if (head[0] === 0xff && head[1] === 0xd8) return 'jpg';
     if (head[0] === 0x52 && head[1] === 0x49) return 'webp';
     if (head[0] === 0x47 && head[1] === 0x49) return 'gif';
     if (head[0] === 0x25 && head[1] === 0x50) return 'pdf';
+    // ZIP マジック (PK\x03\x04)。MIME が multipart/form-data などでも内容が ZIP のことがある
+    // (backend が Content-Type を欠落させるケースを観測 v0.8.13 ログ #327)。
+    // OOXML は ZIP コンテナだが mime 不明だと中身が判別できないので .zip にしておき、
+    // ユーザが必要に応じて拡張子変更する運用とする。
+    if (head[0] === 0x50 && head[1] === 0x4b && (head[2] === 0x03 || head[2] === 0x05 || head[2] === 0x07)) return 'zip';
     const text = String(sampleText || '').replace(/^﻿/, '');
     const trimmed = text.trimStart();
     if (/^[\[{]/.test(trimmed)) return 'json';
@@ -1009,6 +1072,10 @@
   // 終了条件は (a) 成功 (b) 4xx/5xx 等の恒久失敗 (c) waitForCooldown が
   // maxBatchPauseMs 超過で throw、の 3 つのみ。429/503 が続く限り再試行する。
 
+  // 戻り値: { blob, reason } の object。成功時 reason=null、失敗時 reason は
+  // 'HTTP <status>' / 'fetch_error' / 'no_signed_url' / 'invalid_url' / 'signed_HTTP <status>'
+  // のいずれか。BatchPauseError は throw で上に伝搬。reason は呼び出し側でログ出力と
+  // _bulk-asset-failed.log への記録に用いる (v0.8.14 で追加)。
   const downloadAssetBlob = async (fileId, convIdForAsset) => {
     // ChatGPT 本体が実際に叩いているエンドポイントは
     //   /backend-api/files/download/<id>?conversation_id=<convId>&inline=false  (sediment / 生成画像)
@@ -1032,23 +1099,23 @@
         );
       } catch (e) {
         if (e?.isBatchPause) throw e;
-        return null;
+        return { blob: null, reason: `fetch_error:${e?.message || e}` };
       }
       if (r.status === 429 || r.status === 503) {
         noteFileThrottle(parseRetryAfter(r.headers.get('retry-after')));
         continue;
       }
-      if (!r.ok) return null;
+      if (!r.ok) return { blob: null, reason: `HTTP ${r.status}` };
       const ct = (r.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('application/json')) {
         const j = await r.json().catch(() => null);
         const url = j?.download_url || j?.url || j?.file_url || j?.signed_url;
-        if (!url) return null;
+        if (!url) return { blob: null, reason: 'no_signed_url' };
         try {
           const u = new URL(url);
-          if (u.protocol !== 'https:') return null;
+          if (u.protocol !== 'https:') return { blob: null, reason: `invalid_url:${u.protocol}` };
         } catch (_) {
-          return null;
+          return { blob: null, reason: 'invalid_url:parse' };
         }
         // 同一オリジン (chatgpt.com / openai.com) の署名 URL は estuary が
         // Cookie セッションでも認証するため credentials: 'include' でないと
@@ -1060,10 +1127,10 @@
           `asset-url/${fileId}`,
           { maxAttempts: 4, noteThrottle: true, cooldownKind: 'file' },
         );
-        if (!r2.ok) return null;
-        return r2.blob();
+        if (!r2.ok) return { blob: null, reason: `signed_HTTP ${r2.status}` };
+        return { blob: await r2.blob(), reason: null };
       }
-      return r.blob();
+      return { blob: await r.blob(), reason: null };
     }
   };
 
@@ -1193,24 +1260,55 @@
     let failed = 0;
     let skipped = 0;
     let binCount = 0;
+    const assetFailedLines = [];
     for (const [base, asset] of assets) {
       let blob = null;
+      let reason = null;
       try {
-        blob = await downloadAssetBlob(base, convId);
+        const result = await downloadAssetBlob(base, convId);
+        blob = result?.blob || null;
+        reason = result?.reason || null;
       } catch (e) {
         if (e?.isBatchPause) throw e;
+        reason = `exception:${e?.message || e}`;
         console.warn(`  ⚠️ ${tag} backend ${base}: ${e.message}`);
       }
       if (!blob) {
         failed++;
-        console.warn(`  ❌ ${tag} ${base}${asset.composite ? ' (composite)' : ''} [${asset.source}]: 取得不可`);
+        const compositeTag = asset.composite ? ' (composite)' : '';
+        const reasonTag = reason ? ` (${reason})` : '';
+        console.warn(`  ❌ ${tag} ${base}${compositeTag} [${asset.source}]: 取得不可${reasonTag}`);
+        // _bulk-asset-failed.log: TSV (timestamp / convId / assetBase / source / composite / reason)
+        // 会話タイトルは manifest 側にあるため重複保持しない。single で再取得する際は
+        // convId だけ拾えば十分。
+        assetFailedLines.push([
+          new Date().toISOString(),
+          convId,
+          base,
+          asset.source || '',
+          asset.composite ? 'composite' : 'single',
+          reason || 'unknown',
+        ].join('\t'));
         continue;
       }
       const headBytes = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
       const head = headBytes.slice(0, 8);
+      // HTML 応答 / bin skip も extMap に入らないため Markdown 側は「添付ファイル取得不可」になる。
+      // single 再取得対象抽出のために _bulk-asset-failed.log にも積む (v0.8.14 で対応漏れていた)。
+      const recordAssetSkip = (reasonTag) => {
+        assetFailedLines.push([
+          new Date().toISOString(),
+          convId,
+          base,
+          asset.source || '',
+          asset.composite ? 'composite' : 'single',
+          reasonTag,
+        ].join('\t'));
+      };
       if (head[0] === 0x3c) {
         skipped++;
         console.log(`  ⏭️ ${tag} ${base} (HTML応答)`);
+        recordAssetSkip('HTML_response');
         continue;
       }
       const sampleText = new TextDecoder('utf-8').decode(headBytes);
@@ -1220,6 +1318,7 @@
         console.warn(`  ⚠️ ${tag} ${base}: 拡張子不明 (mime=${blob.type || 'unknown'} size=${blob.size}). binBehavior=${OPTIONS.binBehavior}`);
         if (OPTIONS.binBehavior === 'skip') {
           skipped++;
+          recordAssetSkip(`bin_skip:${blob.type || 'unknown'}`);
           continue;
         }
       }
@@ -1233,6 +1332,13 @@
       await sleep(250);
     }
     console.log(`  ✅ ${tag} asset: 保存 ${saved} / スキップ ${skipped} / 失敗 ${failed} / .bin ${binCount}`);
+    if (assetFailedLines.length) {
+      try {
+        await appendAssetFailedLog(assetFailedLines);
+      } catch (e) {
+        console.warn(`  ⚠️ ${tag} ${ASSET_FAILED_LOG_NAME} 追記失敗: ${e?.message || e}`);
+      }
+    }
 
     const displayNameForAsset = (base) => {
       const meta = assetMeta.get(base) || {};
@@ -1709,5 +1815,5 @@
     console.log(`  ℹ️ queue 補完分のうち ${queueOnlyDoneSkipped} 件が done スキップ — 次回 list が完全取得されたタイミングで更新検知されます`);
   }
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 一時停止 ${pausedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.13: _bulk-queue.json による list 揺らぎ対策 + conversation/file cooldown 分離 + throttle 通算 5 回で自動一時停止');
+  console.log('   v0.8.14: 取得失敗の HTTP status をログへ + _bulk-asset-failed.log + Office MIME (docx/pptx/xlsx) 判定 + throttle 通算カウンタの連続成功減衰');
 })();
