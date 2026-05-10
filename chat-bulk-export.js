@@ -1,5 +1,21 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.12
+ * ChatGPT bulk conversation exporter v0.8.13
+ *
+ * v0.8.13 fixes (resume 時の list 揺らぎ対策):
+ * - `/backend-api/conversations` の取得件数が resume 実行ごとに揺れる問題に
+ *   対して `_bulk-queue.json` を導入。過去に list API で見えた会話 ID と
+ *   update_time の union を保存し、`scope: { type: 'all' }` では queue 全体を
+ *   targets として使う。これは完全な最新性保証ではなく、list truncate で
+ *   対象会話が run ごとに消える事故を防ぐための安全網。
+ * - queue 由来で今回 list に出ていない会話は `fromQueueOnly` として扱い、
+ *   done スキップ時に「更新検知できない可能性」を診断ログへ出す。
+ * - conversation API と file API の cooldown を分離。conversation は
+ *   60 → 90 → 120 → 180 秒の段階 cooldown とし、通算 5 回の throttle で
+ *   BatchPauseError による自動一時停止へ移行する。file 側は従来どおり
+ *   60 秒固定で、404 は cooldown 起点にしない。
+ * - cooldown による中断は会話失敗ではないため `_bulk-failed.log` に書かず、
+ *   manifest の該当会話も failed にしない。manifest と queue を保存して
+ *   同じフォルダでの resume に委ねる。
  *
  * v0.8.12 fixes (cooldown 戦略の本格修正):
  * - backend cooldown 機構が事実上空振りしていた問題を解消。fetchWithBackoff の
@@ -143,6 +159,7 @@
  *
  *   <選択フォルダ>/
  *   ├── _bulk-manifest.json
+ *   ├── _bulk-queue.json
  *   ├── _bulk-failed.log
  *   ├── <YYYY-MM-DD>_<title>_<convIdSuffix8>.md  (UUID 末尾 8 文字)
  *   ├── ...
@@ -154,15 +171,17 @@
  * - JSON-only / backend-only。DOM 補正と DOM download fallback は意図的に
  *   無効化している。一括処理では対象会話の DOM が画面に存在しないため、
  *   信頼性のある DOM 経路を構築できないことが理由。
- * - backend 429/503 を受けた場合、バッチ全体で cooldown 解除を待ってから
- *   同じ asset を再試行する（single の DOM fallback には逃がさない）。
- *   これにより throttle 中の大量 asset 失敗を回避する。
+ * - conversation / file の 429/503 は別 cooldown として扱う。conversation は
+ *   通算 throttle 回数で段階的に待機し、回復しない時間帯は自動一時停止して
+ *   resume に委ねる。file は 60 秒固定で同じ asset を再試行する。
  * - 画像欠落の検出 (needs-dom-rerun 等) は出力しない。bulk は DOM-only 画像
  *   の存在を判定できないため、画像が疑わしい会話は chat-single-export.js で
  *   個別に再エクスポートする運用を README で案内する。
  * - レジューム: `_bulk-manifest.json` を会話ごとに全書き換えで保持し、
  *   `status === 'done' && sourceUpdatedAt === conv.update_time` のものは
  *   再実行時にスキップする。
+ * - queue: `_bulk-queue.json` に list API で見えた会話 ID の union を保持し、
+ *   list API の一時的な欠落で targets から未処理会話が消えるのを防ぐ。
  * - chat-single-export.js とは独立した self-contained 実装。共有コア化は
  *   テスト基盤 (Issue #9) 整備後に別 PR で行う。
  *
@@ -198,8 +217,17 @@
   const now = () => Date.now();
   const MIN_WAIT_MS = 800;
   const MANIFEST_NAME = '_bulk-manifest.json';
+  const QUEUE_NAME = '_bulk-queue.json';
   const FAILED_LOG_NAME = '_bulk-failed.log';
   const PAGE_LIMIT = 100;
+
+  class BatchPauseError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'BatchPauseError';
+      this.isBatchPause = true;
+    }
+  }
 
   const session = await fetch('/api/auth/session').then(r => r.json());
   const token = session.accessToken;
@@ -288,15 +316,27 @@
     }
   };
 
-  let backendCooldownUntil = 0;
+  let conversationCooldownUntil = 0;
+  let fileCooldownUntil = 0;
+  let totalConversationPauseMs = 0;
+  let totalFilePauseMs = 0;
   let totalBatchPauseMs = 0;
-  // 30 秒では quota が回復しないことが実機で判明 (v0.8.5〜v0.8.8 のログ)。
-  // 60 秒に延長してサーバ側の rate-limit window を素直に待つ。
-  const COOLDOWN_BASE_MS = 60000;
-  const noteBackendThrottle = (retryAfterMs) => {
-    const base = Math.max(retryAfterMs ?? 0, COOLDOWN_BASE_MS);
-    backendCooldownUntil = Math.max(backendCooldownUntil, now() + base);
-    console.log(`  🧊 backend クールダウン: 次回 ${Math.round((backendCooldownUntil - now()) / 1000)}秒後まで使用しません`);
+  const FILE_COOLDOWN_BASE_MS = 60000;
+  const CONVERSATION_COOLDOWN_LADDER_MS = [60000, 90000, 120000, 180000];
+  let conversationThrottleCount = 0;
+
+  const cooldownLabel = (kind) => kind === 'file' ? 'file' : 'conv';
+  const cooldownUntilFor = (kind) => kind === 'file' ? fileCooldownUntil : conversationCooldownUntil;
+  const kindPauseMs = (kind) => kind === 'file' ? totalFilePauseMs : totalConversationPauseMs;
+  const addKindPauseMs = (kind, value) => {
+    if (kind === 'file') totalFilePauseMs += value;
+    else totalConversationPauseMs += value;
+    totalBatchPauseMs += value;
+  };
+  const formatSec = (ms) => Math.round(ms / 1000);
+  const cooldownAvailable = (kind) => now() >= cooldownUntilFor(kind);
+
+  const bumpAdaptiveDelay = () => {
     const bumped = Math.min(ADAPTIVE_DELAY_MAX_MS, Math.max(adaptiveDelayMs * 2, OPTIONS.perConversationDelayMs * 2));
     if (bumped !== adaptiveDelayMs) {
       adaptiveDelayMs = bumped;
@@ -304,16 +344,43 @@
     }
     consecutiveSuccess = 0;
   };
-  const backendAvailable = () => now() >= backendCooldownUntil;
-  const waitForCooldown = async () => {
-    while (!backendAvailable()) {
-      const remaining = backendCooldownUntil - now();
-      if (totalBatchPauseMs + remaining > OPTIONS.maxBatchPauseMs) {
-        throw new Error(`バッチ累積待機が ${Math.round(OPTIONS.maxBatchPauseMs / 1000)}秒を超過したため中断します`);
+
+  const noteConversationThrottle = (retryAfterMs, status = 429) => {
+    conversationThrottleCount++;
+    if (conversationThrottleCount > CONVERSATION_COOLDOWN_LADDER_MS.length) {
+      throw new BatchPauseError(`conversation API ${status} が通算 ${conversationThrottleCount} 回 — 自動一時停止します。10〜30 分空けて resume してください`);
+    }
+    const ladder = CONVERSATION_COOLDOWN_LADDER_MS[conversationThrottleCount - 1];
+    const base = Math.max(retryAfterMs ?? 0, ladder);
+    conversationCooldownUntil = Math.max(conversationCooldownUntil, now() + base);
+    console.log(`  🧊 conversation クールダウン: 通算 ${conversationThrottleCount} 回 / 次回 ${formatSec(conversationCooldownUntil - now())}秒後まで使用しません`);
+    bumpAdaptiveDelay();
+  };
+
+  const noteFileThrottle = (retryAfterMs) => {
+    const base = Math.max(retryAfterMs ?? 0, FILE_COOLDOWN_BASE_MS);
+    fileCooldownUntil = Math.max(fileCooldownUntil, now() + base);
+    console.log(`  🧊 file クールダウン: 次回 ${formatSec(fileCooldownUntil - now())}秒後まで使用しません`);
+  };
+
+  const noteThrottleForKind = (kind, retryAfterMs, status) => {
+    if (kind === 'file') noteFileThrottle(retryAfterMs);
+    else noteConversationThrottle(retryAfterMs, status);
+  };
+
+  const waitForCooldown = async (kind = 'conversation') => {
+    while (!cooldownAvailable(kind)) {
+      const remaining = cooldownUntilFor(kind) - now();
+      if (
+        totalBatchPauseMs + remaining > OPTIONS.maxBatchPauseMs
+        || kindPauseMs(kind) + remaining > OPTIONS.maxBatchPauseMs
+      ) {
+        throw new BatchPauseError(`バッチ累積待機が ${Math.round(OPTIONS.maxBatchPauseMs / 1000)}秒を超過したため一時停止します`);
       }
-      console.log(`  ⏳ クールダウン待機: 残り ${Math.round(remaining / 1000)}秒`);
+      const label = cooldownLabel(kind);
+      console.log(`  ⏳ クールダウン待機: ${label} 残り ${formatSec(remaining)}秒 (累積 conv ${formatSec(totalConversationPauseMs)}s / file ${formatSec(totalFilePauseMs)}s / 総 ${formatSec(totalBatchPauseMs)}s)`);
       const wait = remaining + 500;
-      totalBatchPauseMs += wait;
+      addKindPauseMs(kind, wait);
       await sleep(wait);
     }
   };
@@ -322,6 +389,7 @@
     const maxAttempts = opts.maxAttempts ?? 26;
     const returnOnThrottle = opts.returnOnThrottle ?? false;
     const noteThrottle = opts.noteThrottle ?? false;
+    const cooldownKind = opts.cooldownKind || 'conversation';
     let lastErr;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let res;
@@ -336,17 +404,17 @@
       }
       if (res.status === 429 || res.status === 503) {
         const ra = parseRetryAfter(res.headers.get('retry-after'));
-        if (noteThrottle) noteBackendThrottle(ra);
+        if (noteThrottle) noteThrottleForKind(cooldownKind, ra, res.status);
         if (returnOnThrottle) return res;
         if (attempt + 1 >= maxAttempts) return res;
-        // backend cooldown が active なら、固定バックオフ秒ではなく cooldown 解除を待つ。
+        // cooldown が active なら、固定バックオフ秒ではなく cooldown 解除を待つ。
         // これがないと 5+8+13+20 ≈ 46秒のバックオフ中に 30〜60秒の cooldown が
         // 満了してしまい、cooldown 機構が事実上空振りする (v0.8.5〜v0.8.8 で観測)。
         // waitForCooldown は累積待機が maxBatchPauseMs を超えたら throw するので、
         // バッチ停止条件は引き続き機能する。
-        if (!backendAvailable()) {
+        if (!cooldownAvailable(cooldownKind)) {
           console.log(`  ⏳ ${res.status} ${label}: クールダウン解除を待機 (${attempt + 1}/${maxAttempts})`);
-          await waitForCooldown();
+          await waitForCooldown(cooldownKind);
           continue;
         }
         const wait = Math.max(MIN_WAIT_MS, ra != null ? ra : Math.min(60000, BACKOFF_BASE_MS * Math.pow(1.6, attempt)));
@@ -376,23 +444,112 @@
     return 0;
   };
 
+  const queueIdCount = (queue) => Array.isArray(queue?.ids) ? queue.ids.length : 0;
+  const newQueue = () => ({
+    version: 1,
+    ids: [],
+  });
+  const normalizeQueueItem = (item, seenAt = new Date().toISOString()) => {
+    if (!item?.id) return null;
+    return {
+      id: String(item.id),
+      update_time: item.update_time ?? item.create_time ?? null,
+      create_time: item.create_time ?? null,
+      title: item.title ?? null,
+      lastSeenAt: seenAt,
+    };
+  };
+  const readQueue = async () => {
+    try {
+      const fh = await rootDir.getFileHandle(QUEUE_NAME);
+      const f = await fh.getFile();
+      const text = await f.text();
+      const j = JSON.parse(text);
+      if (!j || typeof j !== 'object' || j.version !== 1 || !Array.isArray(j.ids)) {
+        console.warn(`  ⚠️ ${QUEUE_NAME} を解釈できないため新規扱いします`);
+        return newQueue();
+      }
+      j.ids = j.ids.map(item => normalizeQueueItem(item, item.lastSeenAt)).filter(Boolean);
+      return j;
+    } catch (_) {
+      return newQueue();
+    }
+  };
+  const writeQueue = async (queue) => {
+    const fh = await rootDir.getFileHandle(QUEUE_NAME, { create: true });
+    const w = await fh.createWritable();
+    await w.write(JSON.stringify(queue || newQueue(), null, 2));
+    await w.close();
+  };
+  const mergeListIntoQueue = (queue, items) => {
+    const q = queue || newQueue();
+    q.ids = Array.isArray(q.ids) ? q.ids : [];
+    const byId = new Map(q.ids.map(item => [item.id, item]));
+    const seenAt = new Date().toISOString();
+    let added = 0;
+    let updated = 0;
+    for (const raw of items || []) {
+      const next = normalizeQueueItem(raw, seenAt);
+      if (!next) continue;
+      const prev = byId.get(next.id);
+      if (!prev) {
+        byId.set(next.id, next);
+        added++;
+        continue;
+      }
+      const prevSec = tsToSeconds(prev.update_time ?? prev.create_time);
+      const nextSec = tsToSeconds(next.update_time ?? next.create_time);
+      if (nextSec >= prevSec) {
+        byId.set(next.id, { ...prev, ...next });
+        updated++;
+      } else {
+        byId.set(next.id, { ...prev, lastSeenAt: seenAt });
+      }
+    }
+    q.ids = Array.from(byId.values()).sort((a, b) => {
+      const bt = tsToSeconds(b.update_time ?? b.create_time);
+      const at = tsToSeconds(a.update_time ?? a.create_time);
+      return bt - at || String(a.id).localeCompare(String(b.id));
+    });
+    return { added, updated, total: q.ids.length };
+  };
+
   const fetchConversationPage = async (offset, limit) => {
     const url = `/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`;
-    const r = await fetchWithBackoff(url, { headers }, `conversations[${offset}..]`, { maxAttempts: 8, noteThrottle: true });
+    const r = await fetchWithBackoff(url, { headers }, `conversations[${offset}..]`, { maxAttempts: 8, noteThrottle: true, cooldownKind: 'conversation' });
     if (!r.ok) throw new Error(`会話リスト取得失敗: HTTP ${r.status}`);
     return r.json();
   };
 
-  const collectConversations = async (scope) => {
+  const collectConversations = async (scope, queue) => {
     const all = [];
+    const seenIds = new Set();
     let offset = 0;
     let total = Infinity;
+    let reportedTotal = null;
+    let endedEarly = false;
+    let paused = false;
     while (offset < total) {
-      const page = await fetchConversationPage(offset, PAGE_LIMIT);
+      let page;
+      try {
+        page = await fetchConversationPage(offset, PAGE_LIMIT);
+      } catch (e) {
+        if (e?.isBatchPause) {
+          paused = true;
+          throw e;
+        }
+        throw e;
+      }
       total = typeof page.total === 'number' ? page.total : (offset + (page.items?.length || 0));
+      reportedTotal = Number.isFinite(total) ? total : reportedTotal;
       const items = page.items || [];
-      if (!items.length) break;
+      if (!items.length) {
+        endedEarly = Number.isFinite(total) && offset < total;
+        break;
+      }
+      mergeListIntoQueue(queue, items);
       for (const c of items) all.push(c);
+      for (const c of items) if (c?.id) seenIds.add(c.id);
       offset += items.length;
       if (scope.type === 'latest' && all.length >= scope.count) break;
       if (scope.type === 'sinceDays') {
@@ -403,7 +560,10 @@
       }
       await sleep(300);
     }
-    return all;
+    if (Number.isFinite(total) && all.length < total && !paused) {
+      endedEarly = endedEarly || (scope.type === 'all' && all.length < total);
+    }
+    return { items: all, seenIds, reportedTotal, endedEarly, paused };
   };
 
   // idList は collectConversations を経由せず main で直接 fetch するため
@@ -416,6 +576,56 @@
       return list.filter(c => tsToSeconds(c.update_time ?? c.create_time) >= cutoff);
     }
     return [];
+  };
+  const queueItemsSorted = (queue) => (Array.isArray(queue?.ids) ? queue.ids : [])
+    .filter(item => item?.id)
+    .slice()
+    .sort((a, b) => {
+      const bt = tsToSeconds(b.update_time ?? b.create_time);
+      const at = tsToSeconds(a.update_time ?? a.create_time);
+      return bt - at || String(a.id).localeCompare(String(b.id));
+    });
+  const targetFromQueueItem = (item, fromQueueOnly) => ({
+    id: item.id,
+    update_time: item.update_time ?? item.create_time ?? null,
+    create_time: item.create_time ?? null,
+    title: item.title ?? null,
+    fromQueueOnly,
+  });
+  const buildTargetsFromQueue = (queue, scope, seenIds = new Set()) => {
+    const items = queueItemsSorted(queue);
+    if (scope.type === 'all') {
+      return items.map(item => targetFromQueueItem(item, !seenIds.has(item.id)));
+    }
+    if (scope.type === 'sinceDays') {
+      const cutoff = (now() / 1000) - (scope.days * 86400);
+      return items
+        .filter(item => tsToSeconds(item.update_time ?? item.create_time) >= cutoff)
+        .map(item => targetFromQueueItem(item, !seenIds.has(item.id)));
+    }
+    return [];
+  };
+  const buildLatestTargets = (list, queue, scope, seenIds = new Set()) => {
+    const count = scope.count || 0;
+    const byId = new Map();
+    for (const item of list.slice(0, count)) {
+      if (!item?.id) continue;
+      byId.set(item.id, { ...item, fromQueueOnly: false });
+    }
+    if (byId.size < count) {
+      const needed = count - byId.size;
+      let added = 0;
+      for (const item of queueItemsSorted(queue)) {
+        if (added >= needed) break;
+        if (!item?.id || byId.has(item.id)) continue;
+        byId.set(item.id, targetFromQueueItem(item, !seenIds.has(item.id)));
+        added++;
+      }
+      if (added > 0) {
+        console.warn(`  ⚠️ latest scope: list が ${byId.size - added}/${count} 件のため queue から ${added} 件補完しました。補完分の update_time は最新とは限りません`);
+      }
+    }
+    return Array.from(byId.values()).slice(0, count);
   };
 
   // ===== Manifest =====
@@ -461,6 +671,23 @@
     const w = await fh.createWritable();
     await w.write(prev + line + '\n');
     await w.close();
+  };
+  const pauseBatch = async ({ manifest, queue, reason }) => {
+    console.warn(`⏸️  ${reason} — 同フォルダで resume してください`);
+    if (queue) {
+      try {
+        await writeQueue(queue);
+      } catch (e) {
+        console.warn(`  ⚠️ ${QUEUE_NAME} 保存に失敗: ${e?.message || e}`);
+      }
+    }
+    if (manifest) {
+      try {
+        await writeManifest(manifest);
+      } catch (e) {
+        console.warn(`  ⚠️ ${MANIFEST_NAME} 保存に失敗: ${e?.message || e}`);
+      }
+    }
   };
 
   // ===== Pure helpers ported from chat-single-export.js =====
@@ -794,20 +1021,21 @@
       : `post_id=&inline=false`;
     const downloadPath = `/backend-api/files/download/${encodeURIComponent(fileId)}?${qs}`;
     while (true) {
-      await waitForCooldown();
+      await waitForCooldown('file');
       let r;
       try {
         r = await fetchWithBackoff(
           downloadPath,
           { headers, redirect: 'follow' },
           `files/${fileId}`,
-          { maxAttempts: 4, returnOnThrottle: true },
+          { maxAttempts: 4, returnOnThrottle: true, cooldownKind: 'file' },
         );
-      } catch (_) {
+      } catch (e) {
+        if (e?.isBatchPause) throw e;
         return null;
       }
       if (r.status === 429 || r.status === 503) {
-        noteBackendThrottle(parseRetryAfter(r.headers.get('retry-after')));
+        noteFileThrottle(parseRetryAfter(r.headers.get('retry-after')));
         continue;
       }
       if (!r.ok) return null;
@@ -826,7 +1054,12 @@
         // Cookie セッションでも認証するため credentials: 'include' でないと
         // 403 になる。それ以外のホストは Cookie を漏らさず 'omit' のまま。
         const sameOrigin = isAllowedAssetHost(url);
-        const r2 = await fetch(url, { credentials: sameOrigin ? 'include' : 'omit' });
+        const r2 = await fetchWithBackoff(
+          url,
+          { credentials: sameOrigin ? 'include' : 'omit' },
+          `asset-url/${fileId}`,
+          { maxAttempts: 4, noteThrottle: true, cooldownKind: 'file' },
+        );
         if (!r2.ok) return null;
         return r2.blob();
       }
@@ -839,9 +1072,9 @@
   const exportConversation = async (convMeta, tag) => {
     const convId = convMeta.id;
 
-    await waitForCooldown();
+    await waitForCooldown('conversation');
     console.log(`📥 ${tag} 会話JSON取得中...`);
-    const convoRes = await fetchWithBackoff(`/backend-api/conversation/${convId}`, { headers }, `conversation ${tag}`, { maxAttempts: 26, noteThrottle: true });
+    const convoRes = await fetchWithBackoff(`/backend-api/conversation/${convId}`, { headers }, `conversation ${tag}`, { maxAttempts: 26, noteThrottle: true, cooldownKind: 'conversation' });
     if (!convoRes.ok) throw new Error(`会話JSON取得失敗: HTTP ${convoRes.status}`);
     const convo = await convoRes.json();
     convo.conversation_id = convo.conversation_id || convId;
@@ -965,7 +1198,7 @@
       try {
         blob = await downloadAssetBlob(base, convId);
       } catch (e) {
-        if (/バッチ累積待機/.test(String(e?.message || ''))) throw e;
+        if (e?.isBatchPause) throw e;
         console.warn(`  ⚠️ ${tag} backend ${base}: ${e.message}`);
       }
       if (!blob) {
@@ -1275,27 +1508,9 @@
   // ===== Main loop =====
 
   let targets;
-  if (OPTIONS.scope.type === 'idList') {
-    const ids = Array.isArray(OPTIONS.scope.ids) ? OPTIONS.scope.ids.filter(Boolean) : [];
-    if (!ids.length) {
-      console.log('idList が空のため終了します');
-      return;
-    }
-    console.log(`📋 idList: ${ids.length} 件を /backend-api/conversation/<id> から直接取得します`);
-    // 一覧取得を経由しないため、404 等の見つからない ID は exportConversation 内で
-    // 例外となり main loop で failed として manifest / _bulk-failed.log に記録される。
-    targets = ids.map(id => ({ id }));
-  } else {
-    console.log('📋 会話リスト取得中...');
-    const allList = await collectConversations(OPTIONS.scope);
-    console.log(`  → 取得 ${allList.length} 件`);
-    targets = filterByScope(allList, OPTIONS.scope);
-    console.log(`📋 対象会話: ${targets.length} 件 (scope=${JSON.stringify(OPTIONS.scope)})`);
-  }
-  if (!targets.length) {
-    console.log('対象がないため終了します');
-    return;
-  }
+  let queue = null;
+  let listResult = null;
+  let listSeenIds = new Set();
 
   const manifest = OPTIONS.resume ? await readManifest() : newManifest();
   manifest.startedAt = new Date().toISOString();
@@ -1311,21 +1526,105 @@
       console.log('   ⚠️ manifest 0 件 — 別フォルダを選択した可能性があります。前回と同じフォルダか確認してください');
     }
   }
+
+  if (OPTIONS.scope.type === 'idList') {
+    const ids = Array.isArray(OPTIONS.scope.ids) ? OPTIONS.scope.ids.filter(Boolean) : [];
+    if (!ids.length) {
+      console.log('idList が空のため終了します');
+      return;
+    }
+    console.log(`📋 idList: ${ids.length} 件を /backend-api/conversation/<id> から直接取得します`);
+    // 一覧取得を経由しないため、404 等の見つからない ID は exportConversation 内で
+    // 例外となり main loop で failed として manifest / _bulk-failed.log に記録される。
+    targets = ids.map(id => ({ id }));
+  } else {
+    queue = await readQueue();
+    const queueBeforeCount = queueIdCount(queue);
+    console.log(`📚 queue 読込: ${queueBeforeCount} 件`);
+    console.log('📋 会話リスト取得中...');
+    try {
+      listResult = await collectConversations(OPTIONS.scope, queue);
+    } catch (e) {
+      if (!e?.isBatchPause) throw e;
+      if (queueIdCount(queue) === 0) {
+        await pauseBatch({ manifest, queue, reason: e.message || String(e) });
+        return;
+      }
+      console.warn(`  ⚠️ 会話リスト取得は一時停止しましたが、既存 queue ${queueIdCount(queue)} 件から続行します: ${e.message || e}`);
+      await writeQueue(queue);
+      listResult = { items: [], seenIds: new Set(), reportedTotal: null, endedEarly: true, paused: true };
+    }
+
+    let allList = listResult.items;
+    listSeenIds = listResult.seenIds || new Set();
+    console.log(`  → 取得 ${allList.length} 件${listResult.reportedTotal != null ? ` / reported total ${listResult.reportedTotal}` : ''}`);
+
+    const shouldSecondPass = OPTIONS.scope.type === 'all' && (
+      queueBeforeCount === 0
+      || listResult.endedEarly
+      || allList.length < queueBeforeCount
+    );
+    if (shouldSecondPass) {
+      console.log('  🔁 会話リスト 2 パス目を実行します');
+      await sleep(2000);
+      try {
+        const second = await collectConversations(OPTIONS.scope, queue);
+        const known = new Set(allList.map(c => c?.id).filter(Boolean));
+        let addedToList = 0;
+        for (const c of second.items) {
+          if (!c?.id || known.has(c.id)) continue;
+          known.add(c.id);
+          allList.push(c);
+          addedToList++;
+        }
+        for (const id of second.seenIds || []) listSeenIds.add(id);
+        console.log(`  🔁 2 パス目: 追加 ${addedToList} 件 / queue ${queueIdCount(queue)} 件`);
+      } catch (e) {
+        if (!e?.isBatchPause) throw e;
+        console.warn(`  ⚠️ 2 パス目は一時停止しました。queue ${queueIdCount(queue)} 件から続行します: ${e.message || e}`);
+      }
+    } else if (OPTIONS.scope.type === 'all') {
+      console.log('  → 1 パス目で揺らぎなし — 2 パス目スキップ');
+    }
+
+    const queueAfterCount = queueIdCount(queue);
+    if (OPTIONS.scope.type === 'all' && allList.length < queueBeforeCount) {
+      console.warn(`⚠️ 会話一覧 API の揺らぎ検出: 今回 ${allList.length} 件 / queue 既知 ${queueBeforeCount} 件 (差 ${queueBeforeCount - allList.length}) — queue から補完して targets を構築します`);
+    }
+    await writeQueue(queue);
+
+    if (OPTIONS.scope.type === 'latest') {
+      targets = buildLatestTargets(filterByScope(allList, OPTIONS.scope), queue, OPTIONS.scope, listSeenIds);
+    } else {
+      targets = buildTargetsFromQueue(queue, OPTIONS.scope, listSeenIds);
+    }
+    console.log(`📚 queue 更新: ${queueBeforeCount} → ${queueAfterCount} 件`);
+    console.log(`📋 対象会話: ${targets.length} 件 (scope=${JSON.stringify(OPTIONS.scope)})`);
+  }
+  if (!targets.length) {
+    console.log('対象がないため終了します');
+    return;
+  }
   let resumeMismatchLogged = 0;
+  let queueOnlySkipWarnLogged = 0;
+  let queueOnlyDoneSkipped = 0;
 
   let succeeded = 0;
   let skippedConv = 0;
   let failedConv = 0;
+  let pausedConv = 0;
   const startedAt = now();
 
   for (let i = 0; i < targets.length; i++) {
     if (window.__bulkAbort) {
       console.warn('🛑 中断要求 (window.__bulkAbort=true) を検出 — 停止します');
+      if (queue) await writeQueue(queue);
+      await writeManifest(manifest);
       break;
     }
     const convMeta = targets[i];
     // 表示用は [i/N] のみ。実際の処理は full UUID で行うため短縮 ID は不要。
-    // 完了ログの ${fname} に日付・タイトル・先頭 8 文字 ID が出るので、
+    // 完了ログの ${fname} に日付・タイトル・末尾 8 文字 ID が出るので、
     // [i/N] と ${fname} の対応で会話を後追いできる。
     const tag = `[${i + 1}/${targets.length}]`;
     const prev = manifest.conversations[convMeta.id];
@@ -1344,6 +1643,13 @@
       && Math.abs(tsToSeconds(prev.sourceUpdatedAt) - tsToSeconds(convMeta.update_time)) <= RESUME_TOLERANCE_SEC
     ) {
       skippedConv++;
+      if (convMeta.fromQueueOnly) {
+        queueOnlyDoneSkipped++;
+        if (queueOnlySkipWarnLogged < 3) {
+          console.log(`  🔁 ${tag} queue補完/未確認: 更新検知できません。次回 list で見えた時点で再判定されます`);
+          queueOnlySkipWarnLogged++;
+        }
+      }
       console.log(`⏭️  ${tag} 変更なし — スキップ`);
       continue;
     }
@@ -1377,6 +1683,11 @@
       succeeded++;
       noteAdaptiveSuccess();
     } catch (e) {
+      if (e?.isBatchPause) {
+        pausedConv++;
+        await pauseBatch({ manifest, queue, reason: e.message || String(e) });
+        break;
+      }
       failedConv++;
       const msg = String(e?.message || e);
       manifest.conversations[convMeta.id] = {
@@ -1387,17 +1698,16 @@
       };
       await appendFailedLog(`${new Date().toISOString()}\t${convMeta.id}\t${msg}`);
       console.error(`❌ ${tag} 失敗:`, e);
-      if (/バッチ累積待機/.test(msg)) {
-        console.warn('🛑 累積待機超過のためバッチを停止します。再実行で resume されます。');
-        await writeManifest(manifest);
-        break;
-      }
     }
     await writeManifest(manifest);
+    if (queue) await writeQueue(queue);
     if (i + 1 < targets.length) await sleep(adaptiveDelayMs);
   }
 
   const elapsedSec = Math.round((now() - startedAt) / 1000);
-  console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.12: cooldown 機構の本格修正 — バックオフ中も cooldown 尊重 + 最低 60 秒 + maxBatchPauseMs 15 分');
+  if (queueOnlyDoneSkipped > 0) {
+    console.log(`  ℹ️ queue 補完分のうち ${queueOnlyDoneSkipped} 件が done スキップ — 次回 list が完全取得されたタイミングで更新検知されます`);
+  }
+  console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 一時停止 ${pausedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
+  console.log('   v0.8.13: _bulk-queue.json による list 揺らぎ対策 + conversation/file cooldown 分離 + throttle 通算 5 回で自動一時停止');
 })();
