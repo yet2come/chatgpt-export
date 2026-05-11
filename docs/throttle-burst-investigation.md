@@ -268,22 +268,25 @@ appendRunStatsJsonl(runStats);
 4. **実験 2 (時刻軸)** — H2 はそもそも実用上「深夜にやれば良い」で済むので、検証より運用ルール化のほうが早い
 5. **実験 3 (asset/サイズ)** — 一番後回し。理論的興味中心
 
-## 7. 既知のドキュメントドリフト (v0.8.16 で解消予定)
+## 7. ドキュメントドリフト解消ログ (v0.8.16 で対応済)
 
-本調査で v0.8.15 の実装と既存 docs の間に次のズレが残っていることが分かった。実装に手を入れる v0.8.16 のタイミングで合わせて修正する。
+調査時点 (v0.8.15) で実装と既存 docs の間に次のズレが残っていた。v0.8.16 の instrumentation 実装と同時に解消済。
 
-| ファイル | 該当行 | 現在の記述 | 実態 |
-|---|---|---|---|
-| [AGENTS.md](../AGENTS.md) | line 33 | `OPTIONS.maxBatchPauseMs`（既定 5 分）| 実装は **15 分** ([chat-bulk-export.js:241](../chat-bulk-export.js#L241)) |
-| [AGENTS.md](../AGENTS.md) | line 61 | 累積待機超過が「唯一の throttle 起点の停止条件」| v0.8.13 で導入された ladder 上限超過 (`throttleLadderExceeded`) も throw する経路がある。v0.8.15 では decay で実質発生しにくいが、構造としては併存 |
-| [CLAUDE.md](../CLAUDE.md) | line 33 | conversation 側は…通算 **5 回** の throttle で…一時停止 | v0.8.15 で 5 件成功 decay + **6 段階 ladder** に拡張済。「通算 5 回」は hard limit ではなくなった |
-| [CLAUDE.md](../CLAUDE.md) | line 61 | 段階 cooldown + 通算 **5 回**で一時停止 | 同上 |
-| [README.md](../README.md) | line 159 | 通算 **5 回**に達した場合や cooldown の累積待機が上限を超えた場合 | 同上。実態としては `maxBatchPauseMs` 超過が支配的 |
+| ファイル | ズレ (v0.8.15 時点) | 解消後 (v0.8.16) |
+|---|---|---|
+| [AGENTS.md](../AGENTS.md) | `OPTIONS.maxBatchPauseMs`（既定 5 分） | **既定 15 分** に修正 + 6 段階 ladder と 5 件成功 decay の併記 |
+| [AGENTS.md](../AGENTS.md) | 累積待機超過が「唯一の throttle 起点の停止条件」 | `throttleLadderExceeded` と `maxBatchPauseMs` の 2 経路併存に修正 |
+| [CLAUDE.md](../CLAUDE.md) | conversation 側は…通算 **5 回** の throttle で…一時停止 | 6 段階 ladder + 5 件成功 decay の説明に置き換え。pause 経路を 2 種類で明示 |
+| [CLAUDE.md](../CLAUDE.md) | 段階 cooldown + 通算 **5 回**で一時停止 | 同上 |
+| [README.md](../README.md) | 通算 **5 回**に達した場合や cooldown の累積待機が上限を超えた場合 | `throttleLadderExceeded` / `maxBatchPauseMs` の 2 経路を明示。短期続行 (10〜30 分) と burst 最大化 (2.5〜3 時間) の使い分けも追加 |
+| [README.md](../README.md) | `maxBatchPauseMs` テーブル説明で「通算閾値で早めに一時停止」 | pause の 2 経路を明示、実機では `maxBatchPauseMs` 経路が支配的と注記 |
+| [README.md](../README.md) | 出力フォルダ構造に `_bulk-run-stats.jsonl` の記載なし | エントリ追加 |
+| [AGENTS.md](../AGENTS.md) / [CLAUDE.md](../CLAUDE.md) | runStats / `_bulk-run-stats.jsonl` の言及なし | bulk 節に追記、本ドキュメント §4.1 へのリンクを設置 |
 
-加えて、§5 で示した「2.5〜3 時間休止 → 1 burst 200 件」の運用パターンは README に未記載。v0.8.16 で README §一括エクスポート / §失敗時 / §運用方針 のいずれかに反映する。
+§5 で示した「2.5〜3 時間休止 → 1 burst 200 件」の運用パターンも v0.8.16 で [README.md](../README.md) §失敗時 に反映済。
 
 ## 関連ファイル
 
-- [chat-bulk-export.js](../chat-bulk-export.js) — v0.8.15 実装
+- [chat-bulk-export.js](../chat-bulk-export.js) — v0.8.16 実装
 - [README.md](../README.md) §一括エクスポート — 運用方針とトラブルシューティング
 - [AGENTS.md](../AGENTS.md) / [CLAUDE.md](../CLAUDE.md) — 設計上の前提

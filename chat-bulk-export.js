@@ -1,5 +1,24 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.15
+ * ChatGPT bulk conversation exporter v0.8.16
+ *
+ * v0.8.16 fixes (run-scoped instrumentation + docs drift の解消):
+ * - バッチ完了時に runStats を構造化出力 + `_bulk-run-stats.jsonl` へ 1 run 1 行
+ *   追記。docs/throttle-burst-investigation.md §4.1 で設計した metric を実装:
+ *     preFirstThrottleSuccessCount  = 最初の 429 までの純粋 burst capacity
+ *     firstThrottleAt               = その時刻 (ISO)
+ *     successBeforePause            = pause 直前の累計成功件数
+ *     conversation429Count          = 通算 429 / 503 観測回数
+ *     cooldownPauseMs               = cooldown 累積待機 (ms)
+ *     throttleEvents / decayEvents  = 時系列復元用
+ *     pauseReason                   = 'maxBatchPauseMs' | 'throttleLadderExceeded'
+ *                                     | 'userAbort' | null
+ *   manifest reset を伴う実験計画でも、後から `gapBeforeRun` (前回 run 終了 →
+ *   今回開始の時間) を復元できるよう JSONL ファイルにも残す。
+ * - BatchPauseError に `pauseKind` フィールドを追加し、main loop で pauseReason
+ *   を正しく分類できるようにした。
+ * - AGENTS.md / CLAUDE.md / README.md の v0.8.15 実装とのズレ
+ *   (`maxBatchPauseMs` 既定値 / 「通算 5 回で一時停止」記述) を解消。詳細は
+ *   docs/throttle-burst-investigation.md §7 を参照。
  *
  * v0.8.15 fixes (conversation throttle decay の実効化):
  * - conversation throttle 通算カウンタの減衰条件を 25 件連続成功から
@@ -253,13 +272,18 @@
   const QUEUE_NAME = '_bulk-queue.json';
   const FAILED_LOG_NAME = '_bulk-failed.log';
   const ASSET_FAILED_LOG_NAME = '_bulk-asset-failed.log';
+  const RUN_STATS_LOG_NAME = '_bulk-run-stats.jsonl';
   const PAGE_LIMIT = 100;
 
   class BatchPauseError extends Error {
-    constructor(message) {
+    constructor(message, kind = null) {
       super(message);
       this.name = 'BatchPauseError';
       this.isBatchPause = true;
+      // v0.8.16: pauseReason 分類用。`'maxBatchPauseMs'` (累積待機超過) /
+      // `'throttleLadderExceeded'` (ladder 上限到達) / null。main loop で
+      // catch して runStats.pauseReason に流す。
+      this.pauseKind = kind;
     }
   }
 
@@ -358,6 +382,7 @@
       const before = conversationThrottleCount;
       conversationThrottleCount--;
       console.log(`  📉 conversation throttle 通算: ${before} → ${conversationThrottleCount} 回 (成功蓄積 ${THROTTLE_COUNT_DECAY_AFTER} 件)`);
+      decayEvents.push({ at: new Date().toISOString(), before, after: conversationThrottleCount });
       successesSinceThrottleDecay = 0;
     }
   };
@@ -370,6 +395,22 @@
   const FILE_COOLDOWN_BASE_MS = 60000;
   const CONVERSATION_COOLDOWN_LADDER_MS = [60000, 90000, 120000, 180000, 240000, 300000];
   let conversationThrottleCount = 0;
+
+  // Run-scoped stats (v0.8.16): batch 開始から終了までの観測値。
+  // noteConversationThrottle / noteAdaptiveSuccess の decay 経路 / main loop の
+  // pause / abort 経路から書き込み、バッチ完了時に runStats として出力する。
+  // succeeded 等の通算カウンタは noteConversationThrottle からも snapshot される
+  // ため、関数定義より前で初期化しておく (TDZ 回避)。
+  let succeeded = 0;
+  let skippedConv = 0;
+  let failedConv = 0;
+  let pausedConv = 0;
+  let firstThrottleAt = null;
+  let preFirstThrottleSuccessCount = null;
+  let conversation429Count = 0;
+  const throttleEvents = [];
+  const decayEvents = [];
+  let pauseReason = null;
 
   const cooldownLabel = (kind) => kind === 'file' ? 'file' : 'conv';
   const cooldownUntilFor = (kind) => kind === 'file' ? fileCooldownUntil : conversationCooldownUntil;
@@ -392,13 +433,28 @@
   };
 
   const noteConversationThrottle = (retryAfterMs, status = 429) => {
+    const at = new Date().toISOString();
+    conversation429Count++;
+    if (preFirstThrottleSuccessCount === null) {
+      preFirstThrottleSuccessCount = succeeded;
+      firstThrottleAt = at;
+    }
     conversationThrottleCount++;
     if (conversationThrottleCount > CONVERSATION_COOLDOWN_LADDER_MS.length) {
-      throw new BatchPauseError(`conversation API ${status} が通算 ${conversationThrottleCount} 回 — 自動一時停止します。10〜30 分空けて resume してください`);
+      throw new BatchPauseError(
+        `conversation API ${status} が通算 ${conversationThrottleCount} 回 — 自動一時停止します。10〜30 分空けて resume してください`,
+        'throttleLadderExceeded',
+      );
     }
     const ladder = CONVERSATION_COOLDOWN_LADDER_MS[conversationThrottleCount - 1];
     const base = Math.max(retryAfterMs ?? 0, ladder);
     conversationCooldownUntil = Math.max(conversationCooldownUntil, now() + base);
+    throttleEvents.push({
+      at,
+      count: conversationThrottleCount,
+      ladderIndex: conversationThrottleCount - 1,
+      cooldownMs: base,
+    });
     console.log(`  🧊 conversation クールダウン: 通算 ${conversationThrottleCount} 回 / 次回 ${formatSec(conversationCooldownUntil - now())}秒後まで使用しません`);
     bumpAdaptiveDelay();
   };
@@ -421,7 +477,10 @@
         totalBatchPauseMs + remaining > OPTIONS.maxBatchPauseMs
         || kindPauseMs(kind) + remaining > OPTIONS.maxBatchPauseMs
       ) {
-        throw new BatchPauseError(`バッチ累積待機が ${Math.round(OPTIONS.maxBatchPauseMs / 1000)}秒を超過したため一時停止します`);
+        throw new BatchPauseError(
+          `バッチ累積待機が ${Math.round(OPTIONS.maxBatchPauseMs / 1000)}秒を超過したため一時停止します`,
+          'maxBatchPauseMs',
+        );
       }
       const label = cooldownLabel(kind);
       console.log(`  ⏳ クールダウン待機: ${label} 残り ${formatSec(remaining)}秒 (累積 conv ${formatSec(totalConversationPauseMs)}s / file ${formatSec(totalFilePauseMs)}s / 総 ${formatSec(totalBatchPauseMs)}s)`);
@@ -731,6 +790,26 @@
     const w = await fh.createWritable();
     await w.write(prev + lines.join('\n') + '\n');
     await w.close();
+  };
+
+  // run-scoped 統計を _bulk-run-stats.jsonl に追記 (v0.8.16)。1 run 1 行の JSONL。
+  // manifest を reset する実験計画でも、後から `gapBeforeRun` (前回 run 終了 →
+  // 今回開始の時間) を復元できるよう、console 出力だけでなくフォルダ内ファイル
+  // にも残す。書き込み失敗してもバッチ完了自体は妨げない (warn のみ)。
+  const appendRunStatsJsonl = async (stats) => {
+    try {
+      const fh = await rootDir.getFileHandle(RUN_STATS_LOG_NAME, { create: true });
+      let prev = '';
+      try {
+        const f = await fh.getFile();
+        prev = await f.text();
+      } catch (_) {}
+      const w = await fh.createWritable();
+      await w.write(prev + JSON.stringify(stats) + '\n');
+      await w.close();
+    } catch (e) {
+      console.warn(`  ⚠️ ${RUN_STATS_LOG_NAME} 書き込み失敗: ${e?.message || e}`);
+    }
   };
   const pauseBatch = async ({ manifest, queue, reason }) => {
     console.warn(`⏸️  ${reason} — 同フォルダで resume してください`);
@@ -1664,6 +1743,7 @@
     } catch (e) {
       if (!e?.isBatchPause) throw e;
       if (queueIdCount(queue) === 0) {
+        pauseReason = e.pauseKind || 'unknown';
         await pauseBatch({ manifest, queue, reason: e.message || String(e) });
         return;
       }
@@ -1726,17 +1806,17 @@
   let queueOnlySkipWarnLogged = 0;
   let queueOnlyDoneSkipped = 0;
 
-  let succeeded = 0;
-  let skippedConv = 0;
-  let failedConv = 0;
-  let pausedConv = 0;
+  // succeeded / skippedConv / failedConv / pausedConv は v0.8.16 で前方へ移動
+  // (noteConversationThrottle から snapshot するため). 初期値 0 のまま使う。
   const startedAt = now();
+  const startedAtIso = new Date(startedAt).toISOString();
 
   for (let i = 0; i < targets.length; i++) {
     if (window.__bulkAbort) {
       console.warn('🛑 中断要求 (window.__bulkAbort=true) を検出 — 停止します');
       if (queue) await writeQueue(queue);
       await writeManifest(manifest);
+      pauseReason = 'userAbort';
       break;
     }
     const convMeta = targets[i];
@@ -1802,6 +1882,7 @@
     } catch (e) {
       if (e?.isBatchPause) {
         pausedConv++;
+        pauseReason = e.pauseKind || pauseReason || 'unknown';
         await pauseBatch({ manifest, queue, reason: e.message || String(e) });
         break;
       }
@@ -1821,10 +1902,37 @@
     if (i + 1 < targets.length) await sleep(adaptiveDelayMs);
   }
 
-  const elapsedSec = Math.round((now() - startedAt) / 1000);
+  const endedAt = now();
+  const elapsedSec = Math.round((endedAt - startedAt) / 1000);
   if (queueOnlyDoneSkipped > 0) {
     console.log(`  ℹ️ queue 補完分のうち ${queueOnlyDoneSkipped} 件が done スキップ — 次回 list が完全取得されたタイミングで更新検知されます`);
   }
   console.log(`\n🎉 バッチ完了: 成功 ${succeeded} / スキップ ${skippedConv} / 失敗 ${failedConv} / 一時停止 ${pausedConv} / 全 ${targets.length} (${elapsedSec}秒)`);
-  console.log('   v0.8.15: throttle 減衰を5件単位に短縮 + throttle成功カウンタをdelay制御から分離 + cooldown ladderを6段階化');
+
+  // v0.8.16: run-scoped 統計を構造化出力。docs/throttle-burst-investigation.md §4.1 の仕様。
+  // preFirstThrottleSuccessCount が null = この run では throttle を観測しなかった。
+  // successBeforePause は succeeded と等価だが、pause 直前の値という意味で別名で出す。
+  const runStats = {
+    version: 'v0.8.16',
+    startedAt: startedAtIso,
+    endedAt: new Date(endedAt).toISOString(),
+    elapsedSec,
+    scope: OPTIONS.scope,
+    totalConversations: targets.length,
+    succeeded,
+    skippedConv,
+    failedConv,
+    pausedConv,
+    preFirstThrottleSuccessCount,
+    firstThrottleAt,
+    successBeforePause: succeeded,
+    conversation429Count,
+    cooldownPauseMs: totalConversationPauseMs,
+    throttleEvents,
+    decayEvents,
+    pauseReason,
+  };
+  console.log('   📊 run-stats:', JSON.stringify(runStats));
+  await appendRunStatsJsonl(runStats);
+  console.log('   v0.8.16: run-scoped instrumentation (runStats / _bulk-run-stats.jsonl) + docs drift 解消');
 })();
