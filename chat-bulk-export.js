@@ -1,5 +1,32 @@
 /**
- * ChatGPT bulk conversation exporter v0.8.16
+ * ChatGPT bulk conversation exporter v0.8.18
+ *
+ * v0.8.18 fixes (session 跨ぎの log duplicate 統合):
+ * - `_bulk-asset-failed.log` が session 跨ぎで `_bulk-asset-failed 2.log` のような
+ *   duplicate に分裂する事例を v0.8.17 の 3 ラン観測で発見
+ *   (docs/observation-experiment-1.md §補足: log 書き込みのバグ 参照)。原因は
+ *   macOS / iCloud / Chrome FSA の相互作用で、`createWritable()` の rename
+ *   レースで既存ファイルが " N.log" にリネームされていたもの。
+ * - `mergeOrphanLogDuplicates(baseName)` を新設し、起動時に同 prefix の duplicate
+ *   ファイル (` 2.log`, ` 3.log`, …) を検出して main file へ統合、duplicate 側は
+ *   空に truncate する。`_bulk-asset-failed.log` と `_bulk-failed.log` の双方を
+ *   対象。
+ *
+ * v0.8.17 fixes (asset 取得失敗の診断強化):
+ * - `_bulk-asset-failed.log` に 7 列目として diag を追加。`HTTP <status>` /
+ *   `no_signed_url` 発生時に backend が返した response body を tab/改行除去 +
+ *   500 文字までに切り詰めて記録する。`HTML_response` のときは blob 先頭
+ *   512 バイトをデコードした文字列を 200 文字まで記録。
+ * - 用途: `no_signed_url` の細分 (削除済 / 期限切れ / 権限切れ) や `HTTP 404`
+ *   の理由特定。docs/observation-experiment-1.md の post-mortem で
+ *   「user upload は概ね 6〜12 ヶ月で no_signed_url 化する」傾向は判明済だが、
+ *   backend が返す `error_code` / `status` 等のフィールドを残さないと
+ *   削除イベント vs 期限切れ vs 権限ロストの分離ができないため。
+ * - 既存の TSV 列 (timestamp / convId / assetBase / source / composite / reason)
+ *   はそのまま。diag が空の行は末尾タブが残るだけで後方互換 (awk -F$'\t' で
+ *   1〜6 列を読む既存スクリプトは無修正で動く)。
+ * - `downloadAssetBlob` の戻り値を `{ blob, reason, diag }` に拡張。
+ *   `recordAssetSkip` も第 2 引数 `diagTag` を受け取れるよう拡張。
  *
  * v0.8.16 fixes (run-scoped instrumentation + docs drift の解消):
  * - バッチ完了時に runStats を構造化出力 + `_bulk-run-stats.jsonl` へ 1 run 1 行
@@ -777,6 +804,64 @@
     await w.write(prev + line + '\n');
     await w.close();
   };
+  // session 跨ぎ + 短時間 rewrite で `_bulk-asset-failed 2.log` のような
+  // duplicate が生成される事例があった (v0.8.17 で観測、docs/observation-experiment-1.md
+  // §補足: log 書き込みのバグ 参照)。macOS / iCloud / Chrome FSA の相互作用で
+  // 既存ファイルが " 2.log" などにリネームされ、新しい session が同名で新規ファイルを
+  // 切り出す症状。startup 時に同 prefix の duplicate を検出してメインファイルへ
+  // 統合し、duplicate 側は空にする。
+  const mergeOrphanLogDuplicates = async (baseName) => {
+    // baseName = "_bulk-asset-failed.log" → match "_bulk-asset-failed 2.log",
+    // "_bulk-asset-failed 3.log" など。
+    const m = baseName.match(/^(.+)\.([^.]+)$/);
+    if (!m) return;
+    const [_, stem, ext] = m;
+    const dupRe = new RegExp(`^${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} (\\d+)\\.${ext}$`);
+    const dupNames = [];
+    try {
+      for await (const [name] of rootDir.entries()) {
+        if (dupRe.test(name)) dupNames.push(name);
+      }
+    } catch (_) {
+      return; // iteration 不可なら何もしない
+    }
+    if (!dupNames.length) return;
+    // duplicate ファイルから内容を吸い上げ、main へ append、duplicate は空に
+    let merged = '';
+    for (const name of dupNames.sort()) {
+      try {
+        const fh = await rootDir.getFileHandle(name);
+        const f = await fh.getFile();
+        const text = await f.text();
+        if (text) {
+          merged += (merged && !merged.endsWith('\n') ? '\n' : '') + text;
+          if (!text.endsWith('\n')) merged += '\n';
+        }
+      } catch (_) { /* skip */ }
+    }
+    if (!merged) return;
+    // main にマージ
+    const mainFh = await rootDir.getFileHandle(baseName, { create: true });
+    let prev = '';
+    try {
+      const f = await mainFh.getFile();
+      prev = await f.text();
+    } catch (_) {}
+    const w = await mainFh.createWritable();
+    await w.write(prev + merged);
+    await w.close();
+    // duplicate ファイルを空にする (削除権限が無いケースに備えて truncate)
+    for (const name of dupNames) {
+      try {
+        const fh = await rootDir.getFileHandle(name);
+        const w2 = await fh.createWritable();
+        await w2.write('');
+        await w2.close();
+      } catch (_) { /* skip */ }
+    }
+    console.log(`  🧹 ${baseName}: duplicate ${dupNames.length} 件をマージしました (${merged.split('\n').filter(Boolean).length} 行)`);
+  };
+
   // asset 単位の失敗ログ。会話完了時にまとめて 1 回だけ書き込み、I/O を抑える
   // (会話あたり数十件失敗するケースがあるため毎件 read-write は重い)。
   const appendAssetFailedLog = async (lines) => {
@@ -1162,10 +1247,21 @@
   // 終了条件は (a) 成功 (b) 4xx/5xx 等の恒久失敗 (c) waitForCooldown が
   // maxBatchPauseMs 超過で throw、の 3 つのみ。429/503 が続く限り再試行する。
 
-  // 戻り値: { blob, reason } の object。成功時 reason=null、失敗時 reason は
+  // 戻り値: { blob, reason, diag } の object。成功時 reason=null、失敗時 reason は
   // 'HTTP <status>' / 'fetch_error' / 'no_signed_url' / 'invalid_url' / 'signed_HTTP <status>'
   // のいずれか。BatchPauseError は throw で上に伝搬。reason は呼び出し側でログ出力と
   // _bulk-asset-failed.log への記録に用いる (v0.8.14 で追加)。
+  // diag は HTTP エラー / no_signed_url 時に backend が返した body を tab/改行除去 +
+  // 500 文字まで切り詰めた診断文字列 (v0.8.17 で追加)。`no_signed_url` の細分
+  // (削除済 / 期限切れ / 権限切れ) や HTTP 404 の理由特定に用いる。
+  const captureBodyText = async (r) => {
+    try {
+      const t = await r.text();
+      return (t || '').replace(/[\t\n\r]+/g, ' ').slice(0, 500);
+    } catch (_) {
+      return '';
+    }
+  };
   const downloadAssetBlob = async (fileId, convIdForAsset) => {
     // ChatGPT 本体が実際に叩いているエンドポイントは
     //   /backend-api/files/download/<id>?conversation_id=<convId>&inline=false  (sediment / 生成画像)
@@ -1195,12 +1291,22 @@
         noteFileThrottle(parseRetryAfter(r.headers.get('retry-after')));
         continue;
       }
-      if (!r.ok) return { blob: null, reason: `HTTP ${r.status}` };
+      if (!r.ok) {
+        const diag = await captureBodyText(r);
+        return { blob: null, reason: `HTTP ${r.status}`, diag };
+      }
       const ct = (r.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('application/json')) {
-        const j = await r.json().catch(() => null);
+        // .json() を 2 回読めないので text を 1 度だけ取って parse する。
+        // no_signed_url 分岐で body を diag に残すため (v0.8.17)。
+        const text = await r.text();
+        let j = null;
+        try { j = text ? JSON.parse(text) : null; } catch (_) { j = null; }
         const url = j?.download_url || j?.url || j?.file_url || j?.signed_url;
-        if (!url) return { blob: null, reason: 'no_signed_url' };
+        if (!url) {
+          const diag = (text || '').replace(/[\t\n\r]+/g, ' ').slice(0, 500);
+          return { blob: null, reason: 'no_signed_url', diag };
+        }
         try {
           const u = new URL(url);
           if (u.protocol !== 'https:') return { blob: null, reason: `invalid_url:${u.protocol}` };
@@ -1354,10 +1460,12 @@
     for (const [base, asset] of assets) {
       let blob = null;
       let reason = null;
+      let diag = '';
       try {
         const result = await downloadAssetBlob(base, convId);
         blob = result?.blob || null;
         reason = result?.reason || null;
+        diag = result?.diag || '';
       } catch (e) {
         if (e?.isBatchPause) throw e;
         reason = `exception:${e?.message || e}`;
@@ -1368,9 +1476,10 @@
         const compositeTag = asset.composite ? ' (composite)' : '';
         const reasonTag = reason ? ` (${reason})` : '';
         console.warn(`  ❌ ${tag} ${base}${compositeTag} [${asset.source}]: 取得不可${reasonTag}`);
-        // _bulk-asset-failed.log: TSV (timestamp / convId / assetBase / source / composite / reason)
+        // _bulk-asset-failed.log: TSV (timestamp / convId / assetBase / source / composite / reason / diag)
         // 会話タイトルは manifest 側にあるため重複保持しない。single で再取得する際は
-        // convId だけ拾えば十分。
+        // convId だけ拾えば十分。diag は v0.8.17 で追加: no_signed_url / HTTP エラー時の
+        // backend body (tab/改行除去 + 500 文字まで)。空のときは末尾タブが残るだけ。
         assetFailedLines.push([
           new Date().toISOString(),
           convId,
@@ -1378,6 +1487,7 @@
           asset.source || '',
           asset.composite ? 'composite' : 'single',
           reason || 'unknown',
+          diag,
         ].join('\t'));
         continue;
       }
@@ -1385,7 +1495,7 @@
       const head = headBytes.slice(0, 8);
       // HTML 応答 / bin skip も extMap に入らないため Markdown 側は「添付ファイル取得不可」になる。
       // single 再取得対象抽出のために _bulk-asset-failed.log にも積む (v0.8.14 で対応漏れていた)。
-      const recordAssetSkip = (reasonTag) => {
+      const recordAssetSkip = (reasonTag, diagTag = '') => {
         assetFailedLines.push([
           new Date().toISOString(),
           convId,
@@ -1393,15 +1503,17 @@
           asset.source || '',
           asset.composite ? 'composite' : 'single',
           reasonTag,
+          diagTag,
         ].join('\t'));
       };
+      const sampleText = new TextDecoder('utf-8').decode(headBytes);
       if (head[0] === 0x3c) {
         skipped++;
         console.log(`  ⏭️ ${tag} ${base} (HTML応答)`);
-        recordAssetSkip('HTML_response');
+        const htmlDiag = sampleText.replace(/[\t\n\r]+/g, ' ').slice(0, 200);
+        recordAssetSkip('HTML_response', htmlDiag);
         continue;
       }
-      const sampleText = new TextDecoder('utf-8').decode(headBytes);
       const ext = guessExt(blob.type, head, sampleText);
       if (ext === 'bin') {
         binCount++;
@@ -1723,6 +1835,16 @@
     }
   }
 
+  // v0.8.18: 過去 session で生まれた " 2.log" duplicate をマージ。
+  // appendAssetFailedLog は session 跨ぎで稀にファイル分離するため、
+  // 起動時に拾い直して main file に統合する。
+  try {
+    await mergeOrphanLogDuplicates(ASSET_FAILED_LOG_NAME);
+    await mergeOrphanLogDuplicates(FAILED_LOG_NAME);
+  } catch (e) {
+    console.warn(`  ⚠️ duplicate log merge 失敗: ${e?.message || e}`);
+  }
+
   if (OPTIONS.scope.type === 'idList') {
     const ids = Array.isArray(OPTIONS.scope.ids) ? OPTIONS.scope.ids.filter(Boolean) : [];
     if (!ids.length) {
@@ -1913,7 +2035,7 @@
   // preFirstThrottleSuccessCount が null = この run では throttle を観測しなかった。
   // successBeforePause は succeeded と等価だが、pause 直前の値という意味で別名で出す。
   const runStats = {
-    version: 'v0.8.16',
+    version: 'v0.8.18',
     startedAt: startedAtIso,
     endedAt: new Date(endedAt).toISOString(),
     elapsedSec,
@@ -1934,5 +2056,5 @@
   };
   console.log('   📊 run-stats:', JSON.stringify(runStats));
   await appendRunStatsJsonl(runStats);
-  console.log('   v0.8.16: run-scoped instrumentation (runStats / _bulk-run-stats.jsonl) + docs drift 解消');
+  console.log('   v0.8.18: session 跨ぎの log duplicate (_bulk-asset-failed 2.log 等) を起動時に統合');
 })();
